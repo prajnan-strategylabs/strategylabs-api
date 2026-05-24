@@ -3,8 +3,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    supabase_url: str
-    supabase_secret_key: str  # service-role key — never expose to browser
+    supabase_url: str = ""
+    supabase_secret_key: str = ""  # service-role key — never expose to browser
     allowed_origins: list[str] = ["http://localhost:5173", "https://strategylabs.trade"]
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
