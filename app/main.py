@@ -56,3 +56,9 @@ app.include_router(signals.router, prefix="/api/v1")
 @app.get("/health", tags=["meta"])
 async def health() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/api/v1/config", tags=["meta"])
+async def get_app_config() -> dict:
+    settings = get_settings()
+    return {"is_launched": settings.is_launched}
