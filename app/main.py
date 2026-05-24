@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import get_settings
-from app.routers import waitlist, strategies, backtests, signals
+from app.routers import waitlist, strategies, backtests, signals, showcase, blogs
 
 
 @asynccontextmanager
@@ -51,6 +51,8 @@ app.include_router(waitlist.router, prefix="/api/v1")
 app.include_router(strategies.router, prefix="/api/v1")
 app.include_router(backtests.router, prefix="/api/v1")
 app.include_router(signals.router, prefix="/api/v1")
+app.include_router(showcase.router, prefix="/api/v1")
+app.include_router(blogs.router, prefix="/api/v1")
 
 
 @app.get("/health", tags=["meta"])
@@ -61,4 +63,7 @@ async def health() -> dict:
 @app.get("/api/v1/config", tags=["meta"])
 async def get_app_config() -> dict:
     settings = get_settings()
-    return {"is_launched": settings.is_launched}
+    return {
+        "is_launched": settings.is_launched,
+        "waitlist_full": settings.waitlist_full,
+    }
