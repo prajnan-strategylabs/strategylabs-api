@@ -1,0 +1,29 @@
+# fly.toml — Strategy Labs API
+# Deploy: fly deploy
+# Docs: https://fly.io/docs/reference/configuration/
+
+app = "strategylabs-api"
+primary_region = "sin"   # Singapore — closest to AU/SEA users; change to "lax" for US
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0   # scale-to-zero on free tier
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 250
+    soft_limit = 200
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1
