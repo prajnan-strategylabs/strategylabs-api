@@ -4,7 +4,9 @@ WORKDIR /app
 
 # Install deps first (better layer caching)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --retries 10 --timeout 60 \
+    --trusted-host pypi.org --trusted-host files.pythonhosted.org \
+    -r requirements.txt
 
 COPY . .
 
