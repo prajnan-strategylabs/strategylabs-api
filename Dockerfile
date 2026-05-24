@@ -2,11 +2,11 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install deps first (better layer caching)
+# Copy locally downloaded wheels and install offline
 COPY requirements.txt .
-RUN pip install --no-cache-dir --retries 10 --timeout 60 \
-    --trusted-host pypi.org --trusted-host files.pythonhosted.org \
-    -r requirements.txt
+COPY wheels ./wheels
+RUN pip install --no-cache-dir --no-index --find-links=wheels -r requirements.txt && \
+    rm -rf wheels
 
 COPY . .
 
