@@ -5,17 +5,15 @@ The frontend still uses Supabase Auth (magic link / OAuth).
 Every authenticated API request must include:
   Authorization: Bearer <supabase_access_token>
 
-We verify the JWT locally using the Supabase JWT secret (HS256)
-so there's no extra round-trip to Supabase on every request.
+We verify the token by calling the official Supabase API client
+to authenticate the user, eliminating the need for a static JWT secret.
 """
-import os
 from typing import Annotated
 
-import jwt
 from fastapi import Depends, HTTPException, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from app.config import get_settings
+from app.db import get_db
 
 bearer = HTTPBearer()
 
@@ -24,30 +22,25 @@ def get_current_user_id(
     creds: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
 ) -> str:
     token = creds.credentials
-    s = get_settings()
-
-    # Supabase signs JWTs with the project's JWT secret.
-    # Set SUPABASE_JWT_SECRET in .env (Settings → API → JWT secret).
-    jwt_secret = os.environ.get("SUPABASE_JWT_SECRET", "")
-    if not jwt_secret:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="JWT secret not configured",
-        )
+    db = get_db()
 
     try:
-        payload = jwt.decode(
-            token,
-            jwt_secret,
-            algorithms=["HS256"],
-            audience="authenticated",
-        )
-        user_id: str = payload["sub"]
+        # Call Supabase Auth API to retrieve user metadata for the token.
+        # This validates the token's signature, expiry, and structure securely.
+        response = db.auth.get_user(token)
+        if not response or not response.user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token or user not found",
+            )
+        user_id: str = response.user.id
         return user_id
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
-    except jwt.InvalidTokenError as exc:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc))
+    except Exception as exc:
+        # Catch any network or authentication errors from Supabase
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Authentication failed: {str(exc)}",
+        )
 
 
 CurrentUser = Annotated[str, Depends(get_current_user_id)]
