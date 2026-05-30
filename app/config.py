@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     blog_pipeline_secret: str = "strategylabs-secret-blog-key-2026"  # protected header key for AI pipeline posts
     is_launched: bool = False
     waitlist_full: bool = False  # when True, hide waitlist signup forms and show "full" state instead
-    allowed_origins: list[str] = ["http://localhost:5173", "https://strategylabs.trade"]
+    allowed_origins: list[str] = ["http://localhost:5173", "https://strategylabs.trade", "https://www.strategylabs.trade"]
 
     # ── Telegram bot (V22 signal notifications) ──────────────────────────────
     # When empty, the notifier becomes a no-op — useful for local dev.
