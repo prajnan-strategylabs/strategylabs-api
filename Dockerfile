@@ -2,7 +2,8 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Copy locally downloaded wheels and install offline
+# Copy locally downloaded wheels and install offline — bypasses Depot builder
+# PyPI connectivity issues entirely.
 COPY requirements.txt .
 COPY wheels ./wheels
 RUN pip install --no-cache-dir --no-index --find-links=wheels -r requirements.txt && \

@@ -1,11 +1,140 @@
 import os
 import csv
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Tuple
 from fastapi import APIRouter, Query, HTTPException
 
+from app.services.v22_stats import get_v22_stats, query_v22_history
+from app.v22.db import list_recent_signals, read_scanner_state
+
 router = APIRouter(prefix="/showcase", tags=["showcase"])
+
+
+def _human_when(iso_ts: str | None) -> str:
+    if not iso_ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+    except Exception:
+        return iso_ts
+    delta = datetime.now(timezone.utc) - dt
+    secs = delta.total_seconds()
+    if secs < 60:
+        return "just now"
+    if secs < 3600:
+        return f"{int(secs / 60)}m ago"
+    if secs < 86400:
+        return f"{int(secs / 3600)}h ago"
+    if secs < 86400 * 7:
+        return f"{int(secs / 86400)}d ago"
+    if secs < 86400 * 30:
+        return f"{int(secs / 86400 / 7)}w ago"
+    if secs < 86400 * 365:
+        return f"{int(secs / 86400 / 30)}mo ago"
+    return f"{int(secs / 86400 / 365)}y ago"
+
+
+def _row_to_call(row: dict) -> dict:
+    """Map a v22_signals row → the JSON shape the frontend already renders."""
+    return {
+        "id": row.get("id"),
+        "asset": row.get("asset") or (row.get("symbol", "").split("/")[0] if row.get("symbol") else ""),
+        "symbol": row.get("symbol"),
+        "dir": (row.get("direction") or "long").upper(),
+        "outcome": row.get("exit_reason") or ("open" if row.get("status") == "open" else "closed"),
+        "status": row.get("status", "closed"),
+        "entry": row.get("entry"),
+        "stop_loss": row.get("stop_loss"),
+        "tp1": row.get("tp1"),
+        "tp2": row.get("tp2"),
+        "rr": row.get("rr"),
+        "risk_usd": row.get("risk_usd"),
+        "position_size": row.get("position_size"),
+        "ret_pct": row.get("ret_pct"),
+        "pnl": row.get("pnl"),
+        "strategy": row.get("strategy"),
+        "entry_time": row.get("entry_time"),
+        "exit_time": row.get("exit_time"),
+        "exit_price": row.get("exit_price"),
+        "exit_reason": row.get("exit_reason"),
+        "when_ago": _human_when(row.get("entry_time")),
+    }
+
+
+@router.get(
+    "/v22",
+    summary="V22 audited track record for the Signals upsell page",
+)
+async def get_v22_showcase(refresh: bool = Query(False, description="Force a CSV reload")) -> Dict[str, Any]:
+    """One-shot endpoint returning everything the Signals page renders:
+    cumulative %, YTD %, win-rate, Sharpe, avg-R, equity curve, year-by-year
+    breakdown, top-5 recent wins, and top-5 most-recent calls (live stream).
+
+    Recent calls are pulled from the live DB if any signals exist there
+    (the V22 scanner writes to v22_signals every 4H). When the DB is still
+    empty (first deploy, scanner hasn't fired yet) we fall back to the
+    historical CSV's most-recent rows so the upsell page never looks empty.
+    """
+    stats = get_v22_stats(force_refresh=refresh)
+
+    # ── Live overlay ────────────────────────────────────────────────────────
+    live_rows = list_recent_signals(limit=5)
+    if live_rows:
+        stats = {**stats, "recent_calls": [_row_to_call(r) for r in live_rows]}
+
+    # ── Scanner heartbeat ───────────────────────────────────────────────────
+    state = read_scanner_state() or {}
+    # The scanner is "live" if EITHER a full scan or a minute-tick exit check
+    # has run recently. We only emit a single `last_scan_at` for the historical
+    # full scan, but either field proves the loop is alive — without this, a
+    # post-deploy scanner shows `live: false` for up to 4 hours until the next
+    # candle close.
+    stats["scanner"] = {
+        "last_scan_at": state.get("last_scan_at"),
+        "last_exit_check": state.get("last_exit_check"),
+        "last_signal_at": state.get("last_signal_at"),
+        "open_count": state.get("open_count"),
+        "live": bool(state.get("last_scan_at") or state.get("last_exit_check")),
+    }
+    return stats
+
+
+@router.get(
+    "/v22/history",
+    summary="Filterable + paginated V22 audit log for the history drawer",
+)
+async def get_v22_history(
+    start: str | None = Query(None, description="ISO date 'YYYY-MM-DD'"),
+    end: str | None = Query(None, description="ISO date 'YYYY-MM-DD'"),
+    symbols: str | None = Query(
+        None,
+        description="Comma-separated assets, e.g. 'BTC,ETH'. Filters by symbol's left side.",
+    ),
+    strategy: str | None = Query(None, description="'S3' or 'S5'"),
+    direction: str | None = Query(None, description="'long' or 'short'"),
+    outcome: str | None = Query(None, description="'win' / 'loss' / 'open'"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> Dict[str, Any]:
+    """Query the full V22 audit log with filters. Returns the requested page
+    of trades + aggregate stats computed over the *filtered* set (so the
+    UI's stats panel reflects whatever's been narrowed down)."""
+    sym_list = (
+        [s.strip() for s in symbols.split(",") if s.strip()]
+        if symbols
+        else None
+    )
+    return query_v22_history(
+        start=start,
+        end=end,
+        symbols=sym_list,
+        strategy=strategy,
+        direction=direction,
+        outcome=outcome,
+        limit=limit,
+        offset=offset,
+    )
 
 # Path to the backtest CSV inside the app container
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")

@@ -5,3 +5,12 @@ pydantic-settings>=2.7.0
 supabase>=2.10.0
 python-dotenv>=1.0.1
 email-validator>=2.0.0
+
+# V22 live scanner (background asyncio task in app/v22/)
+ccxt>=4.5.0
+pandas>=2.2.0
+# pandas-ta — canonical PyPI name (hyphen, not underscore). No version pin
+# because the 0.3.x line is Py<3.12 and 0.4.x is Py>=3.12 — letting pip
+# resolve avoids a mismatch with the Dockerfile's Python 3.12 base image.
+pandas-ta
+numpy>=1.26.0

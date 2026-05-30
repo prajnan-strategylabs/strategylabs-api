@@ -1,3 +1,5 @@
+import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, status
@@ -5,14 +7,43 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import get_settings
-from app.routers import waitlist, strategies, backtests, signals, showcase, blogs
+from app.routers import waitlist, strategies, backtests, signals, showcase, blogs, telegram
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  %(name)s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("app.main")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Validate config on startup so fly.io deploy fails fast if env vars are missing
     get_settings()
+
+    # ── V22 live scanner ─────────────────────────────────────────────────────
+    # Set V22_SCANNER_DISABLED=1 in dev/CI if you don't want the scanner
+    # banging Binance / Supabase every minute.
+    scanner_disabled = os.environ.get("V22_SCANNER_DISABLED", "").lower() in {"1", "true", "yes"}
+    if scanner_disabled:
+        log.info("V22 scanner disabled via V22_SCANNER_DISABLED env var")
+    else:
+        try:
+            from app.v22 import scanner as v22_scanner
+            await v22_scanner.start()
+        except Exception as e:
+            log.exception(f"failed to start V22 scanner: {e}")
+
     yield
+
+    # Graceful shutdown
+    try:
+        from app.v22 import scanner as v22_scanner
+        await v22_scanner.stop()
+    except Exception:
+        pass
 
 
 app = FastAPI(
@@ -53,6 +84,7 @@ app.include_router(backtests.router, prefix="/api/v1")
 app.include_router(signals.router, prefix="/api/v1")
 app.include_router(showcase.router, prefix="/api/v1")
 app.include_router(blogs.router, prefix="/api/v1")
+app.include_router(telegram.router, prefix="/api/v1")
 
 
 @app.get("/health", tags=["meta"])

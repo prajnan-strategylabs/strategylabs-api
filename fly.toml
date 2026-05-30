@@ -14,9 +14,12 @@ primary_region = "sin"   # Singapore — closest to AU/SEA users; change to "lax
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = true
+  # V22 live scanner needs the machine always-on. The asyncio background task
+  # runs the scanner at every 4H candle close (+ 1min open-position checks).
+  # Auto-stopping would cold-start the app and lose the in-memory scanner state.
+  auto_stop_machines = false
   auto_start_machines = true
-  min_machines_running = 0   # scale-to-zero on free tier
+  min_machines_running = 1
 
   [http_service.concurrency]
     type = "requests"
@@ -24,6 +27,8 @@ primary_region = "sin"   # Singapore — closest to AU/SEA users; change to "lax
     soft_limit = 200
 
 [[vm]]
-  memory = "256mb"
+  # Bumped from 256MB → 512MB to accommodate pandas/numpy/ccxt + the V22
+  # scanner's in-memory OHLCV cache for 47 symbols × 3 timeframes.
+  memory = "512mb"
   cpu_kind = "shared"
   cpus = 1

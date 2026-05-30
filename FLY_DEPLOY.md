@@ -41,12 +41,26 @@ fly deploy
 fly logs
 ```
 
-## Scale to zero (free tier)
+## Always-on (required by the V22 live scanner)
 
-The `fly.toml` already sets `min_machines_running = 0` — the API hibernates when idle
-and wakes on the first request (~300ms cold start). Fine for pre-launch traffic.
+The `fly.toml` is configured with `auto_stop_machines = false` and
+`min_machines_running = 1` because the V22 scanner runs as an asyncio
+background task — it needs to run continuously, not just when there's
+inbound HTTP traffic. The VM is also bumped to `512MB` to give pandas /
+numpy / ccxt and the in-memory OHLCV cache enough headroom. Costs ~$4/mo
+on the smallest shared-cpu VM.
 
-Bump to `min_machines_running = 1` once you have paying users.
+If you ever want to disable the scanner (e.g. for local-only testing),
+set `V22_SCANNER_DISABLED=1` in fly secrets — the rest of the API keeps
+working without it.
+
+## Migrations
+
+After the first deploy, run any pending SQL migrations from
+`app/migrations/` in the Supabase SQL editor. The current ones:
+
+- `001_v22_signals.sql` — creates `v22_signals` + `v22_scanner_state`
+  with public-read RLS. Required for the live scanner to persist anything.
 
 ## Env vars reference
 
