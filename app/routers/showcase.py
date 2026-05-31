@@ -100,10 +100,16 @@ async def get_v22_showcase(refresh: bool = Query(False, description="Force a CSV
                 return False  # hit a take-profit → win
             return True  # everything else counts as non-win
 
-        all_losses = len(live_rows) == 5 and all(_is_loss(r) for r in live_rows)
+        # The 10-trade all-losses condition does NOT apply if there is any open/running trade
+        has_open_trade = any(r.get("status") == "open" for r in live_rows)
+        all_losses = (
+            not has_open_trade
+            and len(live_rows) == 5
+            and all(_is_loss(r) for r in live_rows)
+        )
         if all_losses:
             live_rows = list_recent_signals(limit=10)
-            log.info("[showcase] all 5 recent signals are losses — expanded to %d rows", len(live_rows))
+            log.info("[showcase] all 5 recent signals are closed losses — expanded to %d rows", len(live_rows))
         stats = {**stats, "recent_calls": [_row_to_call(r) for r in live_rows]}
 
     # ── Scanner heartbeat ───────────────────────────────────────────────────
