@@ -18,6 +18,8 @@ def _human_when(iso_ts: str | None) -> str:
         return ""
     try:
         dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
     except Exception:
         return iso_ts
     delta = datetime.now(timezone.utc) - dt
@@ -29,12 +31,12 @@ def _human_when(iso_ts: str | None) -> str:
     if secs < 86400:
         return f"{int(secs / 3600)}h ago"
     if secs < 86400 * 7:
-        return f"{int(secs / 86400)}d ago"
+        return f"{round(secs / 86400)}d ago"
     if secs < 86400 * 30:
-        return f"{int(secs / 86400 / 7)}w ago"
+        return f"{round(secs / 86400 / 7)}w ago"
     if secs < 86400 * 365:
-        return f"{int(secs / 86400 / 30)}mo ago"
-    return f"{int(secs / 86400 / 365)}y ago"
+        return f"{round(secs / 86400 / 30)}mo ago"
+    return f"{round(secs / 86400 / 365)}y ago"
 
 
 def _row_to_call(row: dict) -> dict:

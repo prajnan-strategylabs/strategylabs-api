@@ -167,12 +167,12 @@ def _human_when(entry_time: str, now: datetime | None = None) -> str:
     if secs < 86400:
         return f"{int(secs / 3600)}h ago"
     if secs < 86400 * 7:
-        return f"{int(secs / 86400)}d ago"
+        return f"{round(secs / 86400)}d ago"
     if secs < 86400 * 30:
-        return f"{int(secs / 86400 / 7)}w ago"
+        return f"{round(secs / 86400 / 7)}w ago"
     if secs < 86400 * 365:
-        return f"{int(secs / 86400 / 30)}mo ago"
-    return f"{int(secs / 86400 / 365)}y ago"
+        return f"{round(secs / 86400 / 30)}mo ago"
+    return f"{round(secs / 86400 / 365)}y ago"
 
 
 def _equity_curve(trades: list[dict[str, Any]], samples: int = 80) -> list[list[float]]:
