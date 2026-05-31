@@ -25,6 +25,7 @@ class BlogPostResponse(BaseModel):
     slug: str
     excerpt: str
     content: str
+    cover_image: Optional[str] = None
     cover_gradient: str
     read_time: str
     tags: List[str]
@@ -147,6 +148,7 @@ async def get_blogs(
         result = (
             db.table("blogs")
             .select("*")
+            .eq("status", "published")
             .order("created_at", desc=True)
             .execute()
         )
@@ -166,6 +168,7 @@ async def get_blogs(
                     slug=item["slug"],
                     excerpt=item["excerpt"],
                     content=item["content"],
+                    cover_image=item.get("cover_image"),
                     cover_gradient=item.get("cover_gradient") or "from-[#22d3aa]/30 via-[#3b6af1]/25 to-bg-card",
                     read_time=item.get("read_time") or "5 min read",
                     tags=item.get("tags") or [],

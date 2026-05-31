@@ -14,3 +14,7 @@ pandas>=2.2.0
 # resolve avoids a mismatch with the Dockerfile's Python 3.12 base image.
 pandas-ta
 numpy>=1.26.0
+python-multipart>=0.0.9
+boto3>=1.34.0
+
+

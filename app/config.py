@@ -8,7 +8,16 @@ class Settings(BaseSettings):
     blog_pipeline_secret: str = "strategylabs-secret-blog-key-2026"  # protected header key for AI pipeline posts
     is_launched: bool = False
     waitlist_full: bool = False  # when True, hide waitlist signup forms and show "full" state instead
+    admin_enabled: bool = False  # kill switch — disable all /admin/* endpoints
+    admin_emails: str = ""  # comma-separated admin emails via ADMIN_EMAILS env var
     allowed_origins: list[str] = ["http://localhost:5173", "https://strategylabs.trade", "https://www.strategylabs.trade"]
+
+    # ── Cloudflare R2 (S3-compatible storage for blog cover images) ──────────
+    r2_account_id: str = ""
+    r2_access_key_id: str = ""
+    r2_secret_access_key: str = ""
+    r2_bucket_name: str = "strategylabs-blogs"
+    r2_public_url: str = ""
 
     # ── Telegram bot (V22 signal notifications) ──────────────────────────────
     # When empty, the notifier becomes a no-op — useful for local dev.

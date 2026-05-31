@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import get_settings
-from app.routers import waitlist, strategies, backtests, signals, showcase, blogs, telegram
+from app.routers import waitlist, strategies, backtests, signals, showcase, blogs, telegram, admin
 
 
 logging.basicConfig(
@@ -85,6 +85,7 @@ app.include_router(signals.router, prefix="/api/v1")
 app.include_router(showcase.router, prefix="/api/v1")
 app.include_router(blogs.router, prefix="/api/v1")
 app.include_router(telegram.router, prefix="/api/v1")
+app.include_router(admin.router, prefix="/api/v1")
 
 
 @app.get("/health", tags=["meta"])
