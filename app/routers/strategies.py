@@ -107,3 +107,28 @@ async def delete_strategy(
     db: Annotated[Client, Depends(get_db)],
 ) -> None:
     db.table("strategies").delete().eq("id", str(strategy_id)).eq("user_id", user_id).execute()
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class StrategyChatRequest(BaseModel):
+    prompt: str
+    messages: list[ChatMessage] = []
+
+
+@router.post("/chat", summary="Interactive strategy builder and doubt resolver")
+async def strategy_chat(
+    body: StrategyChatRequest,
+    user_id: CurrentUser,
+) -> dict:
+    """
+    Conversational Quant Coach that resolves strategy ambiguities,
+    asks clarifying questions, and compiles natural language into structured rules.
+    """
+    msgs_raw = [{"role": m.role, "content": m.content} for m in body.messages]
+    from app.ai_client import call_ai_chat
+    res = await call_ai_chat(body.prompt, msgs_raw)
+    return res

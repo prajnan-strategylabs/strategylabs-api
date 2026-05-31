@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     admin_emails: str = ""  # comma-separated admin emails via ADMIN_EMAILS env var
     allowed_origins: list[str] = ["http://localhost:5173", "https://strategylabs.trade", "https://www.strategylabs.trade"]
 
+    # ── AI / Quant Coach (Claude & xAI integrations) ─────────────────────────
+    ai_provider: str = "claude"  # "claude" or "xai"
+    ai_api_key: str = ""         # API key (Anthropic or xAI Grok bearer token)
+
     # ── Cloudflare R2 (S3-compatible storage for blog cover images) ──────────
     r2_account_id: str = ""
     r2_access_key_id: str = ""
