@@ -16,8 +16,11 @@ from __future__ import annotations
 import csv
 import math
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any
+
+from app.db import get_db
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 CSV_8YR = os.path.join(DATA_DIR, "s3s5_v22_top47_8yr.csv")
@@ -39,6 +42,61 @@ STARTING_CAPITAL = 5_000.0
 
 # ── module-level cache ────────────────────────────────────────────────────────
 _cache: dict[str, Any] | None = None
+_last_calc_time: float = 0.0
+CACHE_TTL_SECONDS = 600  # 10 minutes cache to prevent database spam
+
+
+def _load_db_closed_trades() -> list[dict[str, Any]]:
+    """Fetch all closed signals from Supabase DB and format them like CSV rows."""
+    trades: list[dict[str, Any]] = []
+    try:
+        db = get_db()
+        result = (
+            db.table("v22_signals")
+            .select("*")
+            .eq("status", "closed")
+            .order("entry_time", desc=False)
+            .execute()
+        )
+        rows = result.data or []
+        for row in rows:
+            try:
+                entry_time = row["entry_time"]
+                exit_time = row.get("exit_time")
+                
+                # Calculate candles_held dynamically from timestamps
+                candles_held = 0
+                if entry_time and exit_time:
+                    try:
+                        # Normalize ISO string formats
+                        t_entry = datetime.fromisoformat(entry_time.replace("Z", "+00:00"))
+                        t_exit = datetime.fromisoformat(exit_time.replace("Z", "+00:00"))
+                        hours = (t_exit - t_entry).total_seconds() / 3600
+                        candles_held = max(1, round(hours / 4))
+                    except Exception:
+                        pass
+
+                trades.append(
+                    {
+                        "symbol": row["symbol"],
+                        "asset": row["symbol"].split("/")[0] if row.get("symbol") else (row.get("asset") or ""),
+                        "entry_time": entry_time,
+                        "direction": row["direction"],
+                        "entry": float(row["entry"]),
+                        "exit_price": float(row["exit_price"]) if row.get("exit_price") is not None else None,
+                        "pnl": float(row["pnl"]) if row.get("pnl") is not None else 0.0,
+                        "risk_usd": float(row.get("risk_usd") or 25.0),
+                        "candles_held": candles_held,
+                        "outcome": row.get("outcome", ""),
+                        "strategy": (row.get("strategy") or "").strip().upper(),
+                    }
+                )
+            except Exception:
+                continue
+    except Exception:
+        # Silently fail if Supabase is offline
+        pass
+    return trades
 
 
 def _parse_trades(filepath: str) -> list[dict[str, Any]]:
@@ -148,9 +206,28 @@ def _build_stats() -> dict[str, Any]:
         trades.sort(key=lambda t: t["entry_time"])
         period_trades.append(trades)
 
-    # Identify the YTD bucket (the last one in CSV_FILES) for YTD-specific stats
-    ytd = period_trades[-1] if period_trades else []
+    # ── Fetch closed trades from database ──
+    db_trades = _load_db_closed_trades()
+    db_trades.sort(key=lambda t: t["entry_time"])
+    period_trades.append(db_trades)
+
     all_trades = [t for period in period_trades for t in period]
+
+    # Deduplicate trades based on unique key (symbol, entry_time, strategy)
+    seen_keys = set()
+    unique_all_trades = []
+    for t in all_trades:
+        key = (t["symbol"], t["entry_time"], t["strategy"])
+        if key not in seen_keys:
+            seen_keys.add(key)
+            unique_all_trades.append(t)
+    all_trades = unique_all_trades
+
+    # Sort chronologically
+    all_trades.sort(key=lambda t: t["entry_time"])
+
+    # Identify the YTD bucket (any trade in the current year, e.g. 2026)
+    ytd = [t for t in all_trades if t["entry_time"].startswith("2026")]
 
     # ── Year-by-year breakdown (combines hist + ytd) ─────────────────────────
     # Years with <10 trades are treated as missing/boundary artifacts and
@@ -217,6 +294,13 @@ def _build_stats() -> dict[str, Any]:
                 t1 = datetime.strptime(all_trades[-1]["entry_time"], "%Y-%m-%d %H:%M")
             except ValueError:
                 t0 = t1 = datetime.now()
+
+        # Strip timezone info to prevent offset-naive vs offset-aware subtraction TypeError
+        if t0.tzinfo is not None:
+            t0 = t0.replace(tzinfo=None)
+        if t1.tzinfo is not None:
+            t1 = t1.replace(tzinfo=None)
+
         years = max(0.5, (t1 - t0).total_seconds() / (365 * 86400))
         trades_per_year = len(all_trades) / years
         sharpe = round((mean / std) * math.sqrt(trades_per_year), 2)
@@ -256,8 +340,13 @@ def _build_stats() -> dict[str, Any]:
         )
 
     # ── Live signal stream: top 5 most recent (any outcome) ─────────────────
+    candidate_trades = list(reversed(all_trades))
+    top_5 = candidate_trades[:5]
+    all_losses = len(top_5) == 5 and all((t.get("pnl") or 0.0) <= 0.0 for t in top_5)
+    
+    limit_count = 10 if all_losses else 5
     recent_calls = []
-    for t in list(reversed(all_trades))[:5]:
+    for t in candidate_trades[:limit_count]:
         ret = _trade_return_pct(t)
         recent_calls.append(
             {
@@ -289,10 +378,12 @@ def _build_stats() -> dict[str, Any]:
 
 
 def get_v22_stats(force_refresh: bool = False) -> dict[str, Any]:
-    """Return cached V22 stats. Recomputes on first call or when forced."""
-    global _cache
-    if _cache is None or force_refresh:
+    """Return cached V22 stats. Recomputes on first call, forced refresh, or TTL expiry."""
+    global _cache, _last_calc_time
+    now = time.time()
+    if _cache is None or force_refresh or (now - _last_calc_time > CACHE_TTL_SECONDS):
         _cache = _build_stats()
+        _last_calc_time = now
     return _cache
 
 
@@ -302,20 +393,40 @@ def get_v22_stats(force_refresh: bool = False) -> dict[str, Any]:
 
 # Lazy module-level cache of the full trade list (built once, refreshed on demand)
 _all_trades_cache: list[dict[str, Any]] | None = None
+_all_trades_last_calc_time: float = 0.0
 
 
 def _load_all_trades(force_refresh: bool = False) -> list[dict[str, Any]]:
-    """Parse + concat every CSV in CSV_FILES once. Sorted newest-first so
+    """Parse + concat every CSV in CSV_FILES and Supabase DB once. Sorted newest-first so
     downstream pagination can slice [offset:offset+limit] without resorting."""
-    global _all_trades_cache
-    if _all_trades_cache is not None and not force_refresh:
+    global _all_trades_cache, _all_trades_last_calc_time
+    now = time.time()
+    if _all_trades_cache is not None and not force_refresh and (now - _all_trades_last_calc_time < CACHE_TTL_SECONDS):
         return _all_trades_cache
+
     all_trades: list[dict[str, Any]] = []
+    # 1. Load CSV trades
     for path in CSV_FILES:
         all_trades.extend(_parse_trades(path))
-    # Stable sort, newest first
-    all_trades.sort(key=lambda t: t["entry_time"], reverse=True)
-    _all_trades_cache = all_trades
+
+    # 2. Load DB closed trades
+    db_trades = _load_db_closed_trades()
+    all_trades.extend(db_trades)
+
+    # 3. Deduplicate
+    seen_keys = set()
+    unique_all_trades = []
+    for t in all_trades:
+        key = (t["symbol"], t["entry_time"], t["strategy"])
+        if key not in seen_keys:
+            seen_keys.add(key)
+            unique_all_trades.append(t)
+
+    # 4. Stable sort, newest first
+    unique_all_trades.sort(key=lambda t: t["entry_time"], reverse=True)
+
+    _all_trades_cache = unique_all_trades
+    _all_trades_last_calc_time = now
     return _all_trades_cache
 
 

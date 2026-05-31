@@ -10,7 +10,14 @@ class Settings(BaseSettings):
     waitlist_full: bool = False  # when True, hide waitlist signup forms and show "full" state instead
     admin_enabled: bool = False  # kill switch — disable all /admin/* endpoints
     admin_emails: str = ""  # comma-separated admin emails via ADMIN_EMAILS env var
-    allowed_origins: list[str] = ["http://localhost:5173", "https://strategylabs.trade", "https://www.strategylabs.trade"]
+    allowed_origins: list[str] = [
+        "http://localhost:5173",
+        "https://strategylabs.trade",
+        "https://www.strategylabs.trade",
+        "http://localhost",
+        "https://localhost",
+        "capacitor://localhost"
+    ]
 
     # ── AI / Quant Coach (Claude & xAI integrations) ─────────────────────────
     ai_provider: str = "claude"  # "claude" or "xai"

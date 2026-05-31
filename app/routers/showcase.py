@@ -1,4 +1,5 @@
 import os
+import logging
 import csv
 import math
 from datetime import datetime, timezone
@@ -9,6 +10,7 @@ from app.services.v22_stats import get_v22_stats, query_v22_history
 from app.v22.db import list_recent_signals, read_scanner_state
 
 router = APIRouter(prefix="/showcase", tags=["showcase"])
+log = logging.getLogger(__name__)
 
 
 def _human_when(iso_ts: str | None) -> str:
@@ -81,6 +83,27 @@ async def get_v22_showcase(refresh: bool = Query(False, description="Force a CSV
     # ── Live overlay ────────────────────────────────────────────────────────
     live_rows = list_recent_signals(limit=5)
     if live_rows:
+        # Check if every row in the batch is a loss/negative outcome.
+        # A row counts as a "loss" when:
+        #   • it is closed with pnl <= 0, OR
+        #   • it is closed with a loss-type exit_reason (stopped_out, etc.), OR
+        #   • it is still open (no positive outcome to show yet: pnl is None).
+        def _is_loss(r: dict) -> bool:
+            pnl = r.get("pnl")
+            if pnl is not None and pnl > 0:
+                return False  # clear win
+            ret = r.get("ret_pct")
+            if ret is not None and ret > 0:
+                return False  # clear win by return
+            reason = (r.get("exit_reason") or "").lower()
+            if reason in ("tp1", "tp2", "target"):
+                return False  # hit a take-profit → win
+            return True  # everything else counts as non-win
+
+        all_losses = len(live_rows) == 5 and all(_is_loss(r) for r in live_rows)
+        if all_losses:
+            live_rows = list_recent_signals(limit=10)
+            log.info("[showcase] all 5 recent signals are losses — expanded to %d rows", len(live_rows))
         stats = {**stats, "recent_calls": [_row_to_call(r) for r in live_rows]}
 
     # ── Scanner heartbeat ───────────────────────────────────────────────────
