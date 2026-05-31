@@ -115,17 +115,37 @@ def list_open_signals() -> list[dict]:
 
 
 def list_recent_signals(limit: int = 5) -> list[dict]:
-    """Latest N signals (open + closed combined, newest first)."""
+    """Latest N signals, putting open ones first and filling the rest with recent closed ones."""
     try:
-        result = (
+        # 1. Fetch all open signals (newest first)
+        open_res = (
             get_db()
             .table("v22_signals")
             .select("*")
+            .eq("status", "open")
             .order("entry_time", desc=True)
-            .limit(limit)
             .execute()
         )
-        return list(result.data or [])
+        open_signals = list(open_res.data or [])
+        
+        # If we already have enough open signals to satisfy the limit, return them
+        if len(open_signals) >= limit:
+            return open_signals[:limit]
+            
+        # 2. Fetch recent closed signals to fill the rest of the limit
+        closed_limit = limit - len(open_signals)
+        closed_res = (
+            get_db()
+            .table("v22_signals")
+            .select("*")
+            .eq("status", "closed")
+            .order("entry_time", desc=True)
+            .limit(closed_limit)
+            .execute()
+        )
+        closed_signals = list(closed_res.data or [])
+        
+        return open_signals + closed_signals
     except Exception as e:
         log.warning(f"[v22] list_recent_signals failed: {e}")
         return []
