@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     # signals, free users don't. Override per environment via fly secrets.
     # Legacy explorer / pro values are still honoured for back-compat.
     telegram_signal_min_tier: str = "trader"
+    revenuecat_webhook_auth: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
