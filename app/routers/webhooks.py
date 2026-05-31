@@ -31,7 +31,13 @@ async def revenuecat_webhook(
 
     event_type = event.get("type")
     user_id = event.get("app_user_id")
-    entitlements = event.get("entitlement_ids", [])
+    
+    # Handle RevenueCat TEST event ping
+    if event_type == "TEST":
+        log.info("Received RevenueCat TEST webhook event successfully.")
+        return {"ok": True, "message": "TEST event received"}
+
+    entitlements = event.get("entitlement_ids") or []
 
     log.info(f"Received RevenueCat webhook: type={event_type}, user_id={user_id}, entitlements={entitlements}")
 
