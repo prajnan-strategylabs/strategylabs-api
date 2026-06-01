@@ -47,8 +47,7 @@ class StatusResponse(BaseModel):
     verified_at: str | None
     last_sent_at: str | None
     bot_username: str | None
-    # The configured tier floor for sending alerts. UI uses this to render
-    # "available on Explorer plan and above" copy.
+    # The configured tier floor for sending alerts.
     signal_min_tier: str
 
 

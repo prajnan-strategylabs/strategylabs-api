@@ -67,7 +67,7 @@ def close_signal(
     pnl: float,
     ret_pct: float,
     outcome: str,
-) -> None:
+) -> bool:
     db = get_db()
     payload = {
         "status": "closed",
@@ -82,8 +82,10 @@ def close_signal(
     try:
         db.table("v22_signals").update(payload).eq("id", signal_id).execute()
         log.info(f"[v22] closed #{signal_id} via {exit_reason} → ${pnl:.2f}")
+        return True
     except Exception as e:
         log.warning(f"[v22] close_signal failed: {e}")
+        return False
 
 
 def touch_signal(signal_id: int) -> None:

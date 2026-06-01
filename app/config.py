@@ -42,7 +42,6 @@ class Settings(BaseSettings):
     # Lowest tier that receives signal alerts. With the 3-tier model
     # (free / trader / auto) this defaults to "trader" — paying users get
     # signals, free users don't. Override per environment via fly secrets.
-    # Legacy explorer / pro values are still honoured for back-compat.
     telegram_signal_min_tier: str = "trader"
     revenuecat_webhook_auth: str = ""
 

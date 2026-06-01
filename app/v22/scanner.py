@@ -34,7 +34,7 @@ from .db import (
 )
 from .exchange import fetch_ohlcv
 from .indicators import add_indicators
-from .notify import notify_new_signal
+from .notify import notify_closed_signal, notify_new_signal
 from .regime import get_btc_regime, get_daily_trend
 from .s3 import check_s3_signal
 from .s5 import check_s5_signal_at
@@ -257,12 +257,17 @@ async def run_exit_checks() -> int:
             log.warning(f"[v22] exit check failed for #{sig.get('id')}: {e}")
             continue
         if exit_data:
-            await asyncio.to_thread(
+            did_close = await asyncio.to_thread(
                 close_signal,
                 sig["id"],
                 **exit_data,
             )
-            closed += 1
+            if did_close:
+                closed += 1
+                try:
+                    asyncio.create_task(notify_closed_signal({**sig, **exit_data, "status": "closed"}))
+                except Exception as e:
+                    log.warning(f"[v22] could not schedule close notify task: {e}")
         else:
             await asyncio.to_thread(touch_signal, sig["id"])
 

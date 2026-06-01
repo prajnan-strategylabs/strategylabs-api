@@ -102,9 +102,7 @@ async def queue_backtest(
     # 3. Enforce strategy backtesting tier limits
     limits = {
         "free": 1,
-        "explorer": 3,
         "trader": 5,
-        "pro": 50,
         "auto": 999999
     }
     user_limit = limits.get(tier.lower(), 1)
@@ -209,8 +207,8 @@ async def analyze_backtest(
     if prof_res.data:
         tier = prof_res.data.get("tier") or "free"
 
-    # 3. Guard: only available for trader or auto (and explorer/pro/etc.)
-    if tier.lower() not in {"trader", "auto", "pro", "explorer"}:
+    # 3. Guard: only available for trader or auto.
+    if tier.lower() not in {"trader", "auto"}:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={

@@ -23,7 +23,7 @@ from app.db import get_db
 log = logging.getLogger("v22.notify")
 
 # Ordered tier ladder: anyone at index ≥ min_tier_idx is eligible.
-TIER_ORDER = ["free", "explorer", "trader", "pro", "auto"]
+TIER_ORDER = ["free", "trader", "auto"]
 
 
 def _tier_index(tier: str) -> int:
@@ -125,6 +125,40 @@ def format_signal_message(signal: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_close_message(signal: dict[str, Any]) -> str:
+    """Plain-text close notification for positions the scanner exits."""
+    asset = signal.get("asset") or signal.get("symbol", "").split("/")[0]
+    direction = (signal.get("direction") or "").upper()
+    strategy = signal.get("strategy", "?")
+    reason = (signal.get("exit_reason") or "closed").replace("_", " ").upper()
+    pnl = signal.get("pnl")
+    ret_pct = signal.get("ret_pct")
+
+    if pnl is None:
+        pnl_label = "—"
+    else:
+        pnl_label = f"{'+' if float(pnl) >= 0 else '-'}${abs(float(pnl)):.2f}"
+
+    if ret_pct is None:
+        ret_label = "—"
+    else:
+        ret_label = f"{'+' if float(ret_pct) >= 0 else ''}{float(ret_pct):.2f}%"
+
+    return "\n".join(
+        [
+            f"V22 CLOSED · {asset}/USDT · {direction}",
+            "────────────────────────",
+            f"Reason     {reason}",
+            f"Entry      {_fmt_price(signal.get('entry'))}",
+            f"Exit       {_fmt_price(signal.get('exit_price'))}",
+            f"P&L        {pnl_label} ({ret_label})",
+            f"Strategy   {strategy}",
+            "────────────────────────",
+            "Audit log updated. This is not financial advice.",
+        ]
+    )
+
+
 # ── Sender ──────────────────────────────────────────────────────────────────
 
 async def _send_one(client: httpx.AsyncClient, token: str, chat_id: int, text: str) -> bool:
@@ -151,18 +185,24 @@ async def _send_one(client: httpx.AsyncClient, token: str, chat_id: int, text: s
 async def notify_new_signal(signal: dict[str, Any]) -> int:
     """Dispatch a fresh V22 signal to every eligible Telegram subscriber.
     Returns the count of successful sends."""
+    return await _dispatch_telegram_text(format_signal_message(signal), "signal")
+
+
+async def notify_closed_signal(signal: dict[str, Any]) -> int:
+    """Dispatch a trade-close update to every eligible Telegram subscriber."""
+    return await _dispatch_telegram_text(format_close_message(signal), "close")
+
+
+async def _dispatch_telegram_text(text: str, label: str) -> int:
     settings = get_settings()
     token = settings.telegram_bot_token
     if not token:
-        # Notifier disabled by config — silent no-op
         return 0
 
-    # Eligibility query is sync (Supabase client) — wrap in to_thread
     eligible = await asyncio.to_thread(_list_eligible_chat_ids)
     if not eligible:
         return 0
 
-    text = format_signal_message(signal)
     sent = 0
     # Bump last_sent_at for each subscriber we successfully notified
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -181,5 +221,5 @@ async def notify_new_signal(signal: dict[str, Any]) -> int:
                 ).eq("chat_id", chat_id).execute()
             except Exception:
                 pass
-    log.info(f"[notify] dispatched signal to {sent}/{len(eligible)} subscribers")
+    log.info(f"[notify] dispatched {label} to {sent}/{len(eligible)} subscribers")
     return sent

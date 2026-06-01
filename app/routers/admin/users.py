@@ -84,7 +84,7 @@ async def update_user_tier(
     """
     Update a user's subscription tier in the profiles table.
     """
-    allowed_tiers = {"free", "explorer", "trader", "pro", "auto"}
+    allowed_tiers = {"free", "trader", "auto"}
     if body.tier not in allowed_tiers:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

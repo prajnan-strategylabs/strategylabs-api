@@ -44,9 +44,12 @@ async def revenuecat_webhook(
     if not user_id:
         return {"ok": True, "message": "No app_user_id, ignored"}
 
-    # We only care about our pro entitlement
-    if "StrategyLabs Pro" not in entitlements and event.get("entitlement_id") != "StrategyLabs Pro":
-        log.info(f"Webhook event for user {user_id} does not affect entitlement 'StrategyLabs Pro'. Ignored.")
+    # We care about StrategyLabs Auto and StrategyLabs Trader entitlements
+    our_entitlements = {"StrategyLabs Auto", "StrategyLabs Trader"}
+    has_our_entitlement = any(e in our_entitlements for e in entitlements) or event.get("entitlement_id") in our_entitlements
+    
+    if not has_our_entitlement:
+        log.info(f"Webhook event for user {user_id} does not affect our entitlements. Ignored.")
         return {"ok": True, "message": "Not our entitlement"}
 
     db = get_db()
@@ -68,13 +71,36 @@ async def revenuecat_webhook(
 
     try:
         if event_type in upgrade_events:
-            # Upgrade user to 'pro'
-            db.table("profiles").update({"tier": "pro"}).eq("id", user_id).execute()
-            log.info(f"Upgraded user {user_id} to pro via webhook")
+            # Determine which tier to upgrade to
+            active_entitlements = set(entitlements)
+            if event.get("entitlement_id"):
+                active_entitlements.add(event.get("entitlement_id"))
+                
+            if "StrategyLabs Auto" in active_entitlements:
+                target_tier = "auto"
+            elif "StrategyLabs Trader" in active_entitlements:
+                target_tier = "trader"
+            else:
+                target_tier = "free"
+                
+            db.table("profiles").update({"tier": target_tier}).eq("id", user_id).execute()
+            log.info(f"Upgraded user {user_id} to {target_tier} via webhook")
         elif event_type in downgrade_events:
-            # Downgrade user to 'free'
-            db.table("profiles").update({"tier": "free"}).eq("id", user_id).execute()
-            log.info(f"Downgraded user {user_id} to free via webhook")
+            # Check what entitlements remain active
+            active_entitlements = set(entitlements)
+            revoked = event.get("entitlement_id")
+            if revoked in active_entitlements:
+                active_entitlements.remove(revoked)
+                
+            if "StrategyLabs Auto" in active_entitlements:
+                target_tier = "auto"
+            elif "StrategyLabs Trader" in active_entitlements:
+                target_tier = "trader"
+            else:
+                target_tier = "free"
+                
+            db.table("profiles").update({"tier": target_tier}).eq("id", user_id).execute()
+            log.info(f"Downgraded/Updated user {user_id} to {target_tier} via webhook")
         else:
             log.info(f"Event type {event_type} ignored")
             
