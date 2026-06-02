@@ -12,6 +12,16 @@ from supabase import Client
 
 log = logging.getLogger(__name__)
 
+
+def make_indicator_regex(col_name: str) -> str:
+    """Helper to convert column names like ema_9 to flexible regexes matching 'ema 9' or 'ema_9'."""
+    import re
+    parts = re.findall(r'[a-zA-Z]+|\d+', col_name)
+    if not parts:
+        return re.escape(col_name)
+    return r'\s*[-_]?\s*'.join(re.escape(p) for p in parts)
+
+
 router = APIRouter(prefix="/backtests", tags=["backtests"])
 
 
@@ -285,13 +295,18 @@ async def _run_backtest(run_id: str, strategy_id: str, start_date: str, end_date
                     
                     found_cols = []
                     for c in col_candidates:
-                        # Match word boundaries to avoid matching substrings
-                        if re.search(r'\b' + re.escape(c) + r'\b', rules_lower):
+                        pattern = make_indicator_regex(c)
+                        if re.search(r'\b' + pattern + r'\b', rules_lower):
                             found_cols.append(c)
                             
                     if len(found_cols) >= 2:
                         # Sort candidates by their appearance index in rules_lower
-                        indices = [(c, rules_lower.find(c)) for c in found_cols]
+                        indices = []
+                        for c in found_cols:
+                            pat = make_indicator_regex(c)
+                            m = re.search(r'\b' + pat + r'\b', rules_lower)
+                            if m:
+                                indices.append((c, m.start()))
                         indices.sort(key=lambda x: x[1])
                         rules["fast_ma"] = indices[0][0]
                         rules["slow_ma"] = indices[1][0]
