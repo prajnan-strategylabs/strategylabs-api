@@ -64,8 +64,12 @@ async def run_claude(api_key: str, system_prompt: str, messages: List[Dict[str, 
             "content": m["content"]
         })
         
+    settings = get_settings()
+    model = settings.ai_model or "claude-sonnet-4-6"
+    log.info(f"Dispatching Anthropic request using model: {model}")
+        
     payload = {
-        "model": "claude-3-5-sonnet-20241022",
+        "model": model,
         "max_tokens": 1500,
         "messages": claude_messages,
         "system": system_prompt,
@@ -77,6 +81,7 @@ async def run_claude(api_key: str, system_prompt: str, messages: List[Dict[str, 
         response.raise_for_status()
         res_data = response.json()
         return res_data["content"][0]["text"]
+
 
 async def run_xai(api_key: str, system_prompt: str, messages: List[Dict[str, str]]) -> str:
     """Queries the xAI Grok API (OpenAI-compatible)."""
