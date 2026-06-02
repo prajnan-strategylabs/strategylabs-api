@@ -44,12 +44,12 @@ async def revenuecat_webhook(
     if not user_id:
         return {"ok": True, "message": "No app_user_id, ignored"}
 
-    # We care about StrategyLabs Auto and StrategyLabs Trader entitlements
-    our_entitlements = {"StrategyLabs Auto", "StrategyLabs Trader"}
+    # We care about StrategyLabs Auto, StrategyLabs Trader, and StrategyLabs Pro entitlements
+    our_entitlements = {"StrategyLabs Auto", "StrategyLabs Trader", "StrategyLabs Pro", "pro", "trader", "auto", "Trader", "Auto"}
     has_our_entitlement = any(e in our_entitlements for e in entitlements) or event.get("entitlement_id") in our_entitlements
     
     if not has_our_entitlement:
-        log.info(f"Webhook event for user {user_id} does not affect our entitlements. Ignored.")
+        log.info(f"Webhook event for user {user_id} does not affect our entitlements. Ignored. Entitlements received: {entitlements}")
         return {"ok": True, "message": "Not our entitlement"}
 
     db = get_db()
@@ -76,9 +76,9 @@ async def revenuecat_webhook(
             if event.get("entitlement_id"):
                 active_entitlements.add(event.get("entitlement_id"))
                 
-            if "StrategyLabs Auto" in active_entitlements:
+            if any(e in {"StrategyLabs Auto", "StrategyLabs Pro", "auto", "pro", "Auto"} for e in active_entitlements):
                 target_tier = "auto"
-            elif "StrategyLabs Trader" in active_entitlements:
+            elif any(e in {"StrategyLabs Trader", "trader", "Trader"} for e in active_entitlements):
                 target_tier = "trader"
             else:
                 target_tier = "free"
@@ -86,16 +86,16 @@ async def revenuecat_webhook(
             db.table("profiles").update({"tier": target_tier}).eq("id", user_id).execute()
             log.info(f"Upgraded user {user_id} to {target_tier} via webhook")
         elif event_type in downgrade_events:
-            # Check what entitlements remain active
-            active_entitlements = set(entitlements)
-            revoked = event.get("entitlement_id")
-            if revoked in active_entitlements:
-                active_entitlements.remove(revoked)
-                
-            if "StrategyLabs Auto" in active_entitlements:
-                target_tier = "auto"
-            elif "StrategyLabs Trader" in active_entitlements:
-                target_tier = "trader"
+            # For downgrade/expiration events, the entitlements listed in this event are the ones being revoked/expired.
+            revoked_entitlements = set(entitlements)
+            if event.get("entitlement_id"):
+                revoked_entitlements.add(event.get("entitlement_id"))
+
+            log.info(f"Processing downgrade event. Revoked entitlements: {revoked_entitlements}")
+            
+            # If the expired entitlement is one of our premium entitlements, downgrade to free
+            if any(e in {"StrategyLabs Auto", "StrategyLabs Pro", "auto", "pro", "Auto", "StrategyLabs Trader", "trader", "Trader"} for e in revoked_entitlements):
+                target_tier = "free"
             else:
                 target_tier = "free"
                 

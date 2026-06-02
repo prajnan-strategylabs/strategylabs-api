@@ -87,6 +87,13 @@ def _list_eligible_chat_ids() -> list[tuple[int, str]]:
 
 # ── Message formatter ───────────────────────────────────────────────────────
 
+def html_escape(val: Any) -> str:
+    if val is None:
+        return ""
+    s = str(val)
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _fmt_price(p: float | None) -> str:
     if p is None:
         return "—"
@@ -97,66 +104,109 @@ def _fmt_price(p: float | None) -> str:
     return f"${p:.6f}".rstrip("0").rstrip(".")
 
 
+def _fmt_raw_price(p: float | None) -> str:
+    if p is None:
+        return "—"
+    if p >= 1000:
+        return f"{p:,.2f}"
+    if p >= 1:
+        return f"{p:.3f}"
+    return f"{p:.6f}".rstrip("0").rstrip(".")
+
+
 def format_signal_message(signal: dict[str, Any]) -> str:
-    """Plain-text message body (Telegram default; no markdown to avoid
-    escaping headaches on funky tickers)."""
-    asset = signal.get("asset") or signal.get("symbol", "").split("/")[0]
-    direction = (signal.get("direction") or "").upper()
+    """HTML message body formatted with premium emojis and tap-to-copy code blocks."""
+    asset = html_escape(signal.get("asset") or signal.get("symbol", "").split("/")[0])
+    direction = html_escape((signal.get("direction") or "").upper())
     arrow = "🟢" if direction == "LONG" else "🔴" if direction == "SHORT" else "⚪"
     rr = signal.get("rr")
-    strategy = signal.get("strategy", "?")
-    entry = signal.get("entry")
-    sl = signal.get("stop_loss")
-    tp1 = signal.get("tp1")
-    tp2 = signal.get("tp2")
+    strategy = html_escape(signal.get("strategy", "?"))
+    
+    entry = _fmt_raw_price(signal.get("entry"))
+    sl = _fmt_raw_price(signal.get("stop_loss"))
+    tp1 = _fmt_raw_price(signal.get("tp1"))
+    tp2 = _fmt_raw_price(signal.get("tp2"))
 
     lines = [
-        f"{arrow} V22 · {asset}/USDT · {direction}",
+        f"🛰 <b>V22 SIGNAL RADAR</b>",
         f"────────────────────────",
-        f"Entry      {_fmt_price(entry)}",
-        f"Stop loss  {_fmt_price(sl)}",
-        f"TP1        {_fmt_price(tp1)}",
+        f"Asset: <b>{asset}/USDT</b>",
+        f"Direction: {arrow} <b>{direction}</b>",
+        f"Strategy: <i>{strategy}</i>",
+        f"",
+        f"🔹 <b>Entry:</b> $<code>{entry}</code>",
+        f"🔸 <b>Stop Loss:</b> $<code>{sl}</code>",
+        f"🎯 <b>Target 1:</b> $<code>{tp1}</code>",
     ]
-    if tp2:
-        lines.append(f"TP2        {_fmt_price(tp2)}")
-    lines.append(f"R:R        {rr}:1   ({strategy})")
-    lines.append("────────────────────────")
-    lines.append("This is not financial advice. Manage your own risk.")
+    if signal.get("tp2") is not None:
+        lines.append(f"🎯 <b>Target 2:</b> $<code>{tp2}</code>")
+        
+    lines.extend([
+        f"",
+        f"⚖️ <b>Risk/Reward:</b> <code>{rr}:1</code>",
+        f"────────────────────────",
+        f"⚠️ <i>Manage your own risk. Not financial advice.</i>"
+    ])
     return "\n".join(lines)
 
 
 def format_close_message(signal: dict[str, Any]) -> str:
-    """Plain-text close notification for positions the scanner exits."""
-    asset = signal.get("asset") or signal.get("symbol", "").split("/")[0]
-    direction = (signal.get("direction") or "").upper()
-    strategy = signal.get("strategy", "?")
-    reason = (signal.get("exit_reason") or "closed").replace("_", " ").upper()
+    """HTML message body for position close events, custom styled for profit vs loss."""
+    asset = html_escape(signal.get("asset") or signal.get("symbol", "").split("/")[0])
+    direction = html_escape((signal.get("direction") or "").upper())
+    strategy = html_escape(signal.get("strategy", "?"))
+    reason = html_escape((signal.get("exit_reason") or "closed").replace("_", " ").upper())
     pnl = signal.get("pnl")
     ret_pct = signal.get("ret_pct")
+
+    # Determine profit vs loss
+    is_profit = False
+    if pnl is not None:
+        is_profit = float(pnl) >= 0
+    elif ret_pct is not None:
+        is_profit = float(ret_pct) >= 0
 
     if pnl is None:
         pnl_label = "—"
     else:
-        pnl_label = f"{'+' if float(pnl) >= 0 else '-'}${abs(float(pnl)):.2f}"
+        pnl_val = float(pnl)
+        pnl_label = f"{'+' if pnl_val >= 0 else '-'}${abs(pnl_val):.2f}"
 
     if ret_pct is None:
         ret_label = "—"
     else:
-        ret_label = f"{'+' if float(ret_pct) >= 0 else ''}{float(ret_pct):.2f}%"
+        ret_val = float(ret_pct)
+        ret_label = f"{'+' if ret_val >= 0 else ''}{ret_val:.2f}%"
 
-    return "\n".join(
-        [
-            f"V22 CLOSED · {asset}/USDT · {direction}",
-            "────────────────────────",
-            f"Reason     {reason}",
-            f"Entry      {_fmt_price(signal.get('entry'))}",
-            f"Exit       {_fmt_price(signal.get('exit_price'))}",
-            f"P&L        {pnl_label} ({ret_label})",
-            f"Strategy   {strategy}",
-            "────────────────────────",
-            "Audit log updated. This is not financial advice.",
-        ]
-    )
+    entry = _fmt_raw_price(signal.get("entry"))
+    exit_price = _fmt_raw_price(signal.get("exit_price"))
+
+    if is_profit:
+        header = "🎉 <b>V22 POSITION CLOSED (PROFIT)</b> 🎉"
+        pnl_status = f"🟢 <b>{pnl_label} ({ret_label})</b>"
+        footer = "📊 <i>Audit log updated. Keep compounding!</i>"
+    else:
+        header = "❌ <b>V22 POSITION CLOSED (LOSS)</b> ❌"
+        pnl_status = f"🔴 <b>{pnl_label} ({ret_label})</b>"
+        footer = "📉 <i>Risk managed. Onto the next trade.</i>"
+
+    lines = [
+        header,
+        "────────────────────────",
+        f"Asset: <b>{asset}/USDT</b>",
+        f"Direction: <b>{direction}</b>",
+        f"Strategy: <i>{strategy}</i>",
+        f"",
+        f"🏁 <b>Exit Reason:</b> <b>{reason}</b>",
+        f"",
+        f"🔹 <b>Entry Price:</b> $<code>{entry}</code>",
+        f"🏁 <b>Exit Price:</b> $<code>{exit_price}</code>",
+        f"",
+        f"💰 <b>P&L:</b> {pnl_status}",
+        "────────────────────────",
+        footer,
+    ]
+    return "\n".join(lines)
 
 
 # ── Sender ──────────────────────────────────────────────────────────────────
@@ -169,6 +219,7 @@ async def _send_one(client: httpx.AsyncClient, token: str, chat_id: int, text: s
             json={
                 "chat_id": chat_id,
                 "text": text,
+                "parse_mode": "HTML",
                 "disable_web_page_preview": True,
             },
             timeout=10.0,

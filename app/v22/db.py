@@ -130,9 +130,10 @@ def list_recent_signals(limit: int = 5) -> list[dict]:
         )
         open_signals = list(open_res.data or [])
         
-        # If we already have enough open signals to satisfy the limit, return them
+        # If we have more than or equal to the limit of open signals, return all of them
+        # so that paid users can always see all open positions in the interface.
         if len(open_signals) >= limit:
-            return open_signals[:limit]
+            return open_signals
             
         # 2. Fetch recent closed signals to fill the rest of the limit
         closed_limit = limit - len(open_signals)
