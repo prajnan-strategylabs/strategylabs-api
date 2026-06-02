@@ -246,7 +246,7 @@ async def call_ai_chat(prompt: str, messages: List[Dict[str, str]]) -> Dict[str,
     """Routes strategy chat calls to Claude, xAI, or local fallback based on config."""
     settings = get_settings()
     provider = (settings.ai_provider or "").lower().strip()
-    api_key = settings.ai_api_key
+    api_key = (settings.ai_api_key or "").strip().strip('"').strip("'")
     
     if not api_key:
         log.info("No AI_API_KEY configured. Falling back to local Quant Coach simulation.")
@@ -279,7 +279,7 @@ async def call_ai_audit(spec: Dict[str, Any], stats: Dict[str, Any]) -> Dict[str
     """Routes strategy auditing calls to Claude, xAI, or local fallback based on config."""
     settings = get_settings()
     provider = (settings.ai_provider or "").lower().strip()
-    api_key = settings.ai_api_key
+    api_key = (settings.ai_api_key or "").strip().strip('"').strip("'")
     
     if not api_key:
         log.info("No AI_API_KEY configured. Falling back to local Quant Coach audit simulation.")
