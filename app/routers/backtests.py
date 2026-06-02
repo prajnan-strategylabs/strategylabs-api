@@ -40,9 +40,19 @@ async def _run_backtest(run_id: str, strategy_id: str, start_date: str, end_date
         source_prompt = strat_res.data.get("source_prompt") if strat_res.data else ""
 
         # Determine target asset and format for Binance ccxt
-        asset_str = str(spec.get("asset", "BTC/USDT")).upper()
+        asset_str = str(spec.get("asset", "BTC/USDT")).upper().strip()
+        asset_str = asset_str.replace(" ", "")
         if "/" not in asset_str:
-            asset_str = f"{asset_str}/USDT"
+            if asset_str.endswith("USDT") and len(asset_str) > 4:
+                asset_str = f"{asset_str[:-4]}/USDT"
+            elif asset_str.endswith("USDC") and len(asset_str) > 4:
+                asset_str = f"{asset_str[:-4]}/USDC"
+            elif asset_str.endswith("BUSD") and len(asset_str) > 4:
+                asset_str = f"{asset_str[:-4]}/BUSD"
+            elif asset_str.endswith("BTC") and len(asset_str) > 3:
+                asset_str = f"{asset_str[:-3]}/BTC"
+            else:
+                asset_str = f"{asset_str}/USDT"
 
         import asyncio
         import random
@@ -65,7 +75,7 @@ async def _run_backtest(run_id: str, strategy_id: str, start_date: str, end_date
             # Fetch daily data using the server's existing exchange data cache
             df = fetch_ohlcv(symbol=asset_str, timeframe="1d", limit=1500)
             if not df.empty and len(df) > 100:
-                # Add technical indicators
+                # Add default technical indicators
                 df["sma_50"] = ta.sma(df["close"], length=50)
                 df["sma_200"] = ta.sma(df["close"], length=200)
                 df["ema_21"] = ta.ema(df["close"], length=21)
@@ -83,13 +93,150 @@ async def _run_backtest(run_id: str, strategy_id: str, start_date: str, end_date
                         df["bb_low"] = bb[bbl]
                         df["bb_mid"] = bb[bbm]
                         df["bb_upper"] = bb[bbu]
-                
-                df = df.ffill().fillna(0)
 
-                # Assemble textual description of user rules
+                # Dynamically download / calculate custom indicators requested in the spec or prompt text
+                def calculate_custom_indicator(df_in: pd.DataFrame, ind_str: str) -> pd.DataFrame:
+                    """Dynamically parses and calculates any technical indicator from pandas_ta."""
+                    import inspect
+                    df_in = df_in.copy()
+                    ind_str = ind_str.strip().lower()
+                    
+                    match = re.match(r"^([a-zA-Z_0-9]+)(?:\s*\(?\s*([^)]*)\s*\)?)?", ind_str)
+                    if not match:
+                        return df_in
+                        
+                    name = match.group(1)
+                    args_str = match.group(2) or ""
+                    
+                    func = None
+                    if hasattr(ta, name):
+                        func = getattr(ta, name)
+                    elif hasattr(df_in.ta, name):
+                        func = getattr(df_in.ta, name)
+                    else:
+                        aliases = {
+                            "sma": ta.sma, "ema": ta.ema, "rsi": ta.rsi, "atr": ta.atr,
+                            "macd": ta.macd, "stoch": ta.stoch, "bb": ta.bbands, "bollinger": ta.bbands,
+                            "bands": ta.bbands, "cci": ta.cci, "adx": ta.adx, "supertrend": ta.supertrend,
+                            "willr": ta.willr, "trix": ta.trix, "obv": ta.obv, "vwap": ta.vwap,
+                            "mom": ta.mom, "std": ta.stdev, "stdev": ta.stdev, "variance": ta.variance
+                        }
+                        func = aliases.get(name)
+                        
+                    if not func:
+                        for attr in dir(ta):
+                            if attr.lower() == name:
+                                func = getattr(ta, attr)
+                                break
+                                
+                    if not func:
+                        return df_in
+                        
+                    args = []
+                    kwargs = {}
+                    if args_str:
+                        parts = re.split(r'[,\s]+', args_str.strip())
+                        for p in parts:
+                            if not p:
+                                continue
+                            try:
+                                if '.' in p:
+                                    args.append(float(p))
+                                else:
+                                    args.append(int(p))
+                            except ValueError:
+                                if '=' in p:
+                                    k, v = p.split('=', 1)
+                                    try:
+                                        kwargs[k.strip()] = float(v.strip()) if '.' in v else int(v.strip())
+                                    except ValueError:
+                                        kwargs[k.strip()] = v.strip()
+                                else:
+                                    args.append(p)
+                                    
+                    try:
+                        sig = inspect.signature(func)
+                        params = list(sig.parameters.keys())
+                        call_kwargs = {}
+                        
+                        for p in params:
+                            p_lower = p.lower()
+                            if p_lower == "close":
+                                call_kwargs[p] = df_in["close"]
+                            elif p_lower == "high":
+                                call_kwargs[p] = df_in["high"]
+                            elif p_lower == "low":
+                                call_kwargs[p] = df_in["low"]
+                            elif p_lower == "volume":
+                                call_kwargs[p] = df_in["volume"]
+                            elif p_lower == "open":
+                                call_kwargs[p] = df_in["open"]
+                                
+                        if not call_kwargs and len(params) > 0:
+                            first_param = params[0]
+                            call_kwargs[first_param] = df_in["close"]
+                            
+                        remaining_params = [p for p in params if p not in call_kwargs]
+                        for idx, val in enumerate(args):
+                            if idx < len(remaining_params):
+                                call_kwargs[remaining_params[idx]] = val
+                                
+                        call_kwargs.update(kwargs)
+                        res = func(**call_kwargs)
+                        
+                        if res is not None:
+                            if isinstance(res, pd.Series):
+                                col_name = res.name if res.name else f"{name}_{args[0]}" if args else name
+                                col_name = str(col_name).lower()
+                                df_in[col_name] = res
+                                if name == "rsi":
+                                    df_in["rsi"] = res
+                                elif name == "atr":
+                                    df_in["atr"] = res
+                            elif isinstance(res, pd.DataFrame):
+                                for col in res.columns:
+                                    col_name = str(col).lower()
+                                    df_in[col_name] = res[col]
+                                    if "macd" in name:
+                                        if "macd_" in col_name or col_name.startswith("macd_"):
+                                            df_in["macd_line"] = res[col]
+                                        elif "macds_" in col_name or "signal" in col_name:
+                                            df_in["macd_signal"] = res[col]
+                                        elif "macdh_" in col_name or "hist" in col_name:
+                                            df_in["macd_hist"] = res[col]
+                                    elif "stoch" in name:
+                                        if "stochk_" in col_name or col_name.endswith("_k") or col_name.startswith("stochk"):
+                                            df_in["stoch_k"] = res[col]
+                                        elif "stochd_" in col_name or col_name.endswith("_d") or col_name.startswith("stochd"):
+                                            df_in["stoch_d"] = res[col]
+                                    elif "bbands" in name or "bb" in name:
+                                        if "bbl_" in col_name or "lower" in col_name:
+                                            df_in["bb_low"] = res[col]
+                                        elif "bbm_" in col_name or "middle" in col_name:
+                                            df_in["bb_mid"] = res[col]
+                                        elif "bbu_" in col_name or "upper" in col_name:
+                                            df_in["bb_upper"] = res[col]
+                    except Exception as e:
+                        log.warning(f"Failed to calculate dynamic indicator '{ind_str}': {e}")
+                    return df_in
+
+                # Extract potential indicator strings from rules text and spec indicators
                 rules_text = f"{spec.get('entry', '')} {spec.get('exit', '')} {spec.get('stop_loss', '')} {spec.get('target', '')} {source_prompt}"
                 rules_lower = rules_text.lower()
-                
+
+                indicators_to_compute = list(spec.get("indicators", []))
+                import re
+                pattern = r'\b(ema|sma|rsi|atr|macd|stoch|bb|bollinger|cci|adx|supertrend|willr|trix|obv|vwap|mom)\b(?:\s*\(?\s*[\d\s,\.-]+\s*\)?)?'
+                found_indicator_matches = [m.group(0) for m in re.finditer(pattern, rules_lower)]
+                for match in found_indicator_matches:
+                    if match not in indicators_to_compute:
+                        indicators_to_compute.append(match)
+
+                for ind in indicators_to_compute:
+                    df = calculate_custom_indicator(df, ind)
+
+                df = df.ffill().fillna(0)
+
                 rules = {
                     "crossover": False,
                     "fast_ma": "ema_50",
@@ -103,7 +250,7 @@ async def _run_backtest(run_id: str, strategy_id: str, start_date: str, end_date
                 }
                 
                 # Check for moving average crossover triggers
-                if "golden cross" in rules_lower or "cross" in rules_lower or "crossover" in rules_lower:
+                if "golden cross" in rules_lower or "cross" in rules_lower or "crossover" in rules_lower or "above" in rules_lower or "below" in rules_lower:
                     rules["crossover"] = True
                     if "sma" in rules_lower:
                         rules["fast_ma"] = "sma_50"
@@ -111,15 +258,45 @@ async def _run_backtest(run_id: str, strategy_id: str, start_date: str, end_date
                     else:
                         rules["fast_ma"] = "ema_50"
                         rules["slow_ma"] = "ema_200"
-                    if "21" in rules_lower:
-                        rules["fast_ma"] = "ema_21"
-                    if "55" in rules_lower:
-                        rules["slow_ma"] = "ema_55"
+                        
+                    # Update crossover lengths dynamically based on rules text (e.g. "ema 9 crossing ema 21")
+                    ma_lengths = sorted([int(x) for x in re.findall(r"(?:ema|sma)\s*\(?\s*(\d+)\s*\)?", rules_lower)])
+                    if len(ma_lengths) >= 2:
+                        fast_len = ma_lengths[0]
+                        slow_len = ma_lengths[1]
+                        ma_type = "sma" if "sma" in rules_lower else "ema"
+                        rules["fast_ma"] = f"{ma_type}_{fast_len}"
+                        rules["slow_ma"] = f"{ma_type}_{slow_len}"
+                        
+                        # Dynamically compute MAs if not already computed
+                        for length in [fast_len, slow_len]:
+                            col_name = f"{ma_type}_{length}"
+                            if col_name not in df.columns:
+                                if ma_type == "sma":
+                                    df[col_name] = ta.sma(df["close"], length=length)
+                                else:
+                                    df[col_name] = ta.ema(df["close"], length=length)
+
+                    # Dynamic crossover: search for any custom computed columns that are mentioned in the rules text
+                    col_candidates = sorted([c for c in df.columns if c not in ["timestamp", "open", "high", "low", "volume"]], key=len, reverse=True)
+                    col_candidates.append("close")
+                    
+                    found_cols = []
+                    for c in col_candidates:
+                        # Match word boundaries to avoid matching substrings
+                        if re.search(r'\b' + re.escape(c) + r'\b', rules_lower):
+                            found_cols.append(c)
+                            
+                    if len(found_cols) >= 2:
+                        # Sort candidates by their appearance index in rules_lower
+                        indices = [(c, rules_lower.find(c)) for c in found_cols]
+                        indices.sort(key=lambda x: x[1])
+                        rules["fast_ma"] = indices[0][0]
+                        rules["slow_ma"] = indices[1][0]
                         
                 # Check for RSI boundary triggers
                 elif "rsi" in rules_lower:
                     rules["rsi_buy"] = True
-                    import re
                     matches = re.findall(r"rsi\s*(?:<|<=|below|dips below)\s*(\d+)", rules_lower)
                     if matches:
                         rules["rsi_buy_level"] = float(matches[0])
@@ -128,8 +305,11 @@ async def _run_backtest(run_id: str, strategy_id: str, start_date: str, end_date
                 elif "lower band" in rules_lower or "bb low" in rules_lower or "bollinger low" in rules_lower or "bbl" in rules_lower:
                     rules["bb_buy"] = True
 
+                # Dynamic check for MACD and Stochastic crossover indicators
+                rules["macd_crossover"] = "macd" in rules_lower and ("cross" in rules_lower or "signal" in rules_lower)
+                rules["stoch_crossover"] = "stoch" in rules_lower and "cross" in rules_lower
+
                 # ATR stop loss multiplier parsing
-                import re
                 sl_match = re.findall(r"(\d+(?:\.\d+)?)\s*(?:\*|x)?\s*atr", rules_lower)
                 if sl_match:
                     rules["sl_atr_mult"] = float(sl_match[0])
@@ -168,6 +348,26 @@ async def _run_backtest(run_id: str, strategy_id: str, start_date: str, end_date
                                 buy_triggered = (fast_val < slow_val) and (prev_fast >= prev_slow)
                             else:
                                 buy_triggered = (fast_val > slow_val) and (prev_fast <= prev_slow)
+                                
+                        elif rules.get("macd_crossover") and "macd_line" in df.columns and "macd_signal" in df.columns:
+                            macd_val = row["macd_line"]
+                            sig_val = row["macd_signal"]
+                            prev_macd = prev_row["macd_line"]
+                            prev_sig = prev_row["macd_signal"]
+                            if rules["is_short"]:
+                                buy_triggered = (macd_val < sig_val) and (prev_macd >= prev_sig)
+                            else:
+                                buy_triggered = (macd_val > sig_val) and (prev_macd <= prev_sig)
+                                
+                        elif rules.get("stoch_crossover") and "stoch_k" in df.columns and "stoch_d" in df.columns:
+                            k_val = row["stoch_k"]
+                            d_val = row["stoch_d"]
+                            prev_k = prev_row["stoch_k"]
+                            prev_d = prev_row["stoch_d"]
+                            if rules["is_short"]:
+                                buy_triggered = (k_val < d_val) and (prev_k >= prev_d)
+                            else:
+                                buy_triggered = (k_val > d_val) and (prev_k <= prev_d)
                                 
                         elif rules["rsi_buy"]:
                             rsi_val = row["rsi"]
@@ -353,9 +553,20 @@ async def _run_backtest(run_id: str, strategy_id: str, start_date: str, end_date
                 2026: {"win_rate": 53.0, "pnl_win_range": (1.6, 3.6), "pnl_loss_range": (-1.3, -0.8)}
             }
 
-            year_price_map = asset_yearly_prices.get(asset_base, {
+            year_price_map = {}
+            fallback_map = asset_yearly_prices.get(asset_base, {
                 y: 100.0 * (1.2 ** (y - 2018)) for y in range(2018, 2027)
             })
+            year_price_map.update(fallback_map)
+            
+            if 'df' in locals() and not df.empty:
+                try:
+                    df_copy = df.copy()
+                    df_copy["year"] = df_copy["timestamp"].dt.year
+                    for yr, group in df_copy.groupby("year"):
+                        year_price_map[int(yr)] = float(group["close"].mean())
+                except Exception as e:
+                    log.warning(f"Could not compute real yearly prices for simulation: {e}")
 
             trades = []
             yearly_breakdown = []

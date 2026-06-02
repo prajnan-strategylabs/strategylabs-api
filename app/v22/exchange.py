@@ -43,6 +43,41 @@ def fetch_ohlcv(
     force: bool = False,
 ) -> pd.DataFrame:
     """Fetch OHLCV bars from Binance. Cached per (symbol, timeframe)."""
+    # Robust symbol matching and resolution using CCXT markets
+    try:
+        symbol_upper = symbol.upper().strip()
+        # Load markets if not already loaded to check validity
+        if not _exchange.markets:
+            try:
+                _exchange.load_markets()
+            except Exception as e:
+                log.warning(f"Failed to load markets during fetch_ohlcv: {e}")
+        
+        if _exchange.markets:
+            if symbol_upper in _exchange.markets:
+                symbol = symbol_upper
+            else:
+                # 1. Try match without punctuation
+                norm_target = symbol_upper.replace("/", "").replace("-", "").replace("_", "").replace(" ", "")
+                found = False
+                for m_sym in _exchange.markets:
+                    m_norm = m_sym.upper().replace("/", "").replace("-", "").replace("_", "").replace(" ", "")
+                    if norm_target == m_norm:
+                        symbol = m_sym
+                        found = True
+                        break
+                
+                # 2. Try common quote currency suffixes if not found
+                if not found:
+                    for quote in ["/USDT", "/USDC", "/BUSD", "/BTC"]:
+                        test_sym = f"{symbol_upper}{quote}"
+                        if test_sym in _exchange.markets:
+                            symbol = test_sym
+                            found = True
+                            break
+    except Exception as e:
+        log.warning(f"Error normalising symbol '{symbol}': {e}")
+
     key = (symbol, timeframe)
     ttl = _CACHE_TTL_S.get(timeframe, 60)
     entry = _cache.get(key)
