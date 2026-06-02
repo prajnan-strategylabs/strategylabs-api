@@ -1,6 +1,7 @@
 from typing import Annotated
 from uuid import UUID
 from datetime import datetime
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, status
 from pydantic import BaseModel
@@ -9,6 +10,7 @@ from app.auth import CurrentUser
 from app.db import get_db
 from supabase import Client
 
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/backtests", tags=["backtests"])
 
