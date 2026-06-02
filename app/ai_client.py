@@ -65,8 +65,9 @@ async def run_claude(api_key: str, system_prompt: str, messages: List[Dict[str, 
         })
         
     settings = get_settings()
-    model = settings.ai_model or "claude-sonnet-4-6"
+    model = settings.ai_model or "claude-opus-4-6"
     log.info(f"Dispatching Anthropic request using model: {model}")
+
         
     payload = {
         "model": model,

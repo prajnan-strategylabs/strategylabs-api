@@ -1,5 +1,6 @@
 from typing import Annotated
 from uuid import UUID
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, status
 from pydantic import BaseModel
@@ -7,6 +8,7 @@ from pydantic import BaseModel
 from app.auth import CurrentUser
 from app.db import get_db
 from supabase import Client
+
 
 router = APIRouter(prefix="/backtests", tags=["backtests"])
 
@@ -146,9 +148,9 @@ async def queue_backtest(
     run = result.data[0]
     
     # 6. Spawn simulated quant task in background
-    from datetime import datetime
     background_tasks.add_task(_run_backtest, run["id"], str(body.strategy_id), body.start_date, body.end_date, db)
     return run
+
 
 
 @router.get("/{run_id}", summary="Get backtest run status and results")

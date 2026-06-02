@@ -22,7 +22,8 @@ class Settings(BaseSettings):
     # ── AI / Quant Coach (Claude & xAI integrations) ─────────────────────────
     ai_provider: str = "claude"  # "claude" or "xai"
     ai_api_key: str = ""         # API key (Anthropic or xAI Grok bearer token)
-    ai_model: str = "claude-sonnet-4-6" # The specific Claude or xAI model to query (defaults to claude-sonnet-4-6 for 2026 support)
+    ai_model: str = "claude-opus-4-6" # The specific Claude or xAI model to query (defaults to claude-opus-4-6 for 2026 support)
+
 
 
     # ── Cloudflare R2 (S3-compatible storage for blog cover images) ──────────
