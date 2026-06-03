@@ -479,7 +479,7 @@ async def _run_backtest(run_id: str, strategy_id: str, start_date: str, end_date
                             })
                             in_position = False
 
-                if len(trades) >= 3:
+                if len(trades) >= 1:
                     real_backtest_success = True
                     
                     # Compute yearly stats directly from actual trades
