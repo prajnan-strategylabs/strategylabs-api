@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     blog_pipeline_secret: str = "strategylabs-secret-blog-key-2026"  # protected header key for AI pipeline posts
     is_launched: bool = False
     waitlist_full: bool = False  # when True, hide waitlist signup forms and show "full" state instead
+    prelaunch_auth_emails: str = "cprajnan@gmail.com"  # comma-separated emails allowed to request OTP before launch
     admin_enabled: bool = False  # kill switch — disable all /admin/* endpoints
     admin_emails: str = ""  # comma-separated admin emails via ADMIN_EMAILS env var
     allowed_origins: list[str] = [
