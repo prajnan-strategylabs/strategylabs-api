@@ -1058,8 +1058,16 @@ async def queue_backtest(
     if prof_res.data:
         tier = prof_res.data.get("tier") or "free"
 
-    # 2. Count existing completed or queued backtest runs
-    count_res = db.table("backtest_runs").select("id", count="exact").eq("user_id", user_id).execute()
+    # 2. Count existing runs toward the quota — a run that failed (bad rule,
+    #    no trades, engine error) never consumed a real backtest, so it
+    #    shouldn't burn the user's allowance. Only queued/running/completed count.
+    count_res = (
+        db.table("backtest_runs")
+        .select("id", count="exact")
+        .eq("user_id", user_id)
+        .neq("status", "failed")
+        .execute()
+    )
     count = count_res.count or 0
 
     # 3. Enforce strategy backtesting tier limits
