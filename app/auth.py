@@ -8,7 +8,7 @@ Every authenticated API request must include:
 We verify the token by calling the official Supabase API client
 to authenticate the user, eliminating the need for a static JWT secret.
 """
-from typing import Annotated
+from typing import Annotated, Optional
 
 from fastapi import Depends, HTTPException, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -16,6 +16,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from app.db import get_db
 
 bearer = HTTPBearer()
+bearer_optional = HTTPBearer(auto_error=False)
 
 
 def get_current_user_id(
@@ -43,4 +44,38 @@ def get_current_user_id(
         )
 
 
+def get_optional_user_id(
+    creds: Annotated[Optional[HTTPAuthorizationCredentials], Security(bearer_optional)],
+) -> Optional[str]:
+    """Same idea as get_current_user_id but never raises — for endpoints that
+    are publicly viewable (e.g. the marketing showcase) yet must still know
+    who's asking so paid-tier content can be gated. Missing or invalid tokens
+    simply resolve to None (anonymous / free)."""
+    if creds is None:
+        return None
+    db = get_db()
+    try:
+        response = db.auth.get_user(creds.credentials)
+        if not response or not response.user:
+            return None
+        return response.user.id
+    except Exception:
+        return None
+
+
+def resolve_tier(user_id: Optional[str], db) -> str:
+    """Free/trader/auto tier for a possibly-anonymous user. Never raises —
+    callers on public endpoints should degrade to "free" rather than 500."""
+    if not user_id:
+        return "free"
+    try:
+        prof = db.table("profiles").select("tier").eq("id", user_id).single().execute()
+        if prof.data:
+            return (prof.data.get("tier") or "free").lower()
+    except Exception:
+        pass
+    return "free"
+
+
 CurrentUser = Annotated[str, Depends(get_current_user_id)]
+OptionalUser = Annotated[Optional[str], Depends(get_optional_user_id)]
