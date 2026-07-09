@@ -2,55 +2,15 @@ import os
 import logging
 import csv
 import math
-from datetime import datetime, timedelta, timezone
-from typing import Annotated, List, Dict, Any, Tuple
-from fastapi import APIRouter, Depends, Query, HTTPException
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Tuple
+from fastapi import APIRouter, Query, HTTPException
 
-from app.auth import OptionalUser, resolve_tier
-from app.db import get_db
 from app.services.v22_stats import get_v22_stats, query_v22_history
 from app.v22.db import list_recent_signals, read_scanner_state
-from supabase import Client
 
 router = APIRouter(prefix="/showcase", tags=["showcase"])
 log = logging.getLogger(__name__)
-
-# Free tier gets what the marketing promises — "24h-delayed signals" — everyone
-# else (Trader/Auto) gets the real-time feed. This is enforced here, not just
-# in the UI, because these endpoints are unauthenticated-callable by design
-# (the public showcase/audit story) and were previously returning the full
-# real-time feed to anyone who called the API directly.
-PAID_TIERS = {"trader", "auto"}
-FREE_SIGNAL_DELAY = timedelta(hours=24)
-FREE_LIVE_PREVIEW_LIMIT = 5
-
-
-def _visible_for_free(row: dict, cutoff: datetime) -> bool:
-    """Free tier never sees a still-open position early, and only sees closed
-    outcomes once they're older than the delay window."""
-    if row.get("status") == "open":
-        return False
-    ts = row.get("entry_time")
-    if not ts:
-        return True
-    try:
-        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-    except Exception:
-        return True
-    return dt <= cutoff
-
-
-def _fetch_live_rows(is_paid: bool, want: int) -> list[dict]:
-    """Recent signals, applying the free-tier delay + open-position hold-back.
-    Free tier needs a larger raw pool since recent/open rows get filtered out
-    before the final slice."""
-    if is_paid:
-        return list_recent_signals(limit=want)
-    cutoff = datetime.now(timezone.utc) - FREE_SIGNAL_DELAY
-    raw = list_recent_signals(limit=max(want * 6, 30))
-    return [r for r in raw if _visible_for_free(r, cutoff)][:want]
 
 
 def _human_when(iso_ts: str | None) -> str:
@@ -110,11 +70,7 @@ def _row_to_call(row: dict) -> dict:
     "/v22",
     summary="V22 audited track record for the Signals upsell page",
 )
-async def get_v22_showcase(
-    user_id: OptionalUser,
-    db: Annotated[Client, Depends(get_db)],
-    refresh: bool = Query(False, description="Force a CSV reload"),
-) -> Dict[str, Any]:
+async def get_v22_showcase(refresh: bool = Query(False, description="Force a CSV reload")) -> Dict[str, Any]:
     """One-shot endpoint returning everything the Signals page renders:
     cumulative %, YTD %, win-rate, Sharpe, avg-R, equity curve, year-by-year
     breakdown, top-5 recent wins, and top-5 most-recent calls (live stream).
@@ -124,15 +80,15 @@ async def get_v22_showcase(
     empty (first deploy, scanner hasn't fired yet) we fall back to the
     historical CSV's most-recent rows so the upsell page never looks empty.
 
-    Free-tier / anonymous callers get the recent-calls feed delayed 24h with
-    open positions held back, matching the free-plan promise; Trader/Auto get
-    the unrestricted real-time feed.
+    Free-tier gating (masking live entry/SL/TP, one free sample call, closed
+    history fully visible) happens in the UI (LiveSignalDrawer/Signals.tsx) —
+    this endpoint always returns the real data so that masking has something
+    to mask instead of just showing nothing for free-tier users.
     """
     stats = get_v22_stats(force_refresh=refresh)
-    is_paid = resolve_tier(user_id, db) in PAID_TIERS
 
     # ── Live overlay ────────────────────────────────────────────────────────
-    live_rows = _fetch_live_rows(is_paid, 5)
+    live_rows = list_recent_signals(limit=5)
     if live_rows:
         # Check if every row in the batch is a loss/negative outcome.
         # A row counts as a "loss" when:
@@ -159,7 +115,7 @@ async def get_v22_showcase(
             and all(_is_loss(r) for r in live_rows)
         )
         if all_losses:
-            live_rows = _fetch_live_rows(is_paid, 10)
+            live_rows = list_recent_signals(limit=10)
             log.info("[showcase] all 5 recent signals are closed losses — expanded to %d rows", len(live_rows))
         stats = {**stats, "recent_calls": [_row_to_call(r) for r in live_rows]}
 
@@ -185,8 +141,6 @@ async def get_v22_showcase(
     summary="Filterable + paginated V22 audit log for the history drawer",
 )
 async def get_v22_history(
-    user_id: OptionalUser,
-    db: Annotated[Client, Depends(get_db)],
     start: str | None = Query(None, description="ISO date 'YYYY-MM-DD'"),
     end: str | None = Query(None, description="ISO date 'YYYY-MM-DD'"),
     symbols: str | None = Query(
@@ -201,19 +155,8 @@ async def get_v22_history(
 ) -> Dict[str, Any]:
     """Query the full V22 audit log with filters. Returns the requested page
     of trades + aggregate stats computed over the *filtered* set (so the
-    UI's stats panel reflects whatever's been narrowed down).
-
-    Free-tier / anonymous callers are clamped to entries at least 24h old —
-    matching the free-plan promise — while the full pre-existing historical
-    backtest (2017-2024), which is intentionally public for audit purposes,
-    stays fully visible either way. Trader/Auto see everything, unclamped.
-    """
-    is_paid = resolve_tier(user_id, db) in PAID_TIERS
-    effective_end = end
-    if not is_paid:
-        cutoff_date = (datetime.now(timezone.utc) - FREE_SIGNAL_DELAY).date().isoformat()
-        effective_end = min(end, cutoff_date) if end else cutoff_date
-
+    UI's stats panel reflects whatever's been narrowed down). Full history is
+    intentionally public/unrestricted — it's the audit-transparency story."""
     sym_list = (
         [s.strip() for s in symbols.split(",") if s.strip()]
         if symbols
@@ -221,7 +164,7 @@ async def get_v22_history(
     )
     return query_v22_history(
         start=start,
-        end=effective_end,
+        end=end,
         symbols=sym_list,
         strategy=strategy,
         direction=direction,

@@ -1018,6 +1018,11 @@ def _trade_chart_payload(stats: dict, spec: dict, trade_index: int) -> dict:
 async def _run_backtest(run_id: str, strategy_id: str, start_date: str, end_date: str, db: Client) -> None:
     try:
         db.table("backtest_runs").update({"status": "running"}).eq("id", run_id).execute()
+        # Mirror the run's lifecycle onto the parent strategy — without this the
+        # strategy row is stuck on "draft" forever (its DB default at creation),
+        # and the Dashboard hides real results behind a bare "Draft" label even
+        # after a strategy has a completed, successful backtest.
+        db.table("strategies").update({"status": "backtesting"}).eq("id", strategy_id).execute()
 
         strat_res = db.table("strategies").select("spec, source_prompt").eq("id", strategy_id).single().execute()
         spec = (strat_res.data or {}).get("spec") or {}
@@ -1031,16 +1036,19 @@ async def _run_backtest(run_id: str, strategy_id: str, start_date: str, end_date
             "stats": stats,
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", run_id).execute()
+        db.table("strategies").update({"status": "ready"}).eq("id", strategy_id).execute()
 
     except BacktestError as be:
         log.info(f"Backtest {run_id} failed honestly: {be}")
         db.table("backtest_runs").update({"status": "failed", "error": str(be)}).eq("id", run_id).execute()
+        db.table("strategies").update({"status": "draft"}).eq("id", strategy_id).execute()
     except Exception as exc:
         log.exception(f"Backtest {run_id} crashed")
         db.table("backtest_runs").update({
             "status": "failed",
             "error": "The backtest engine hit an unexpected error. Please try again or rephrase the strategy.",
         }).eq("id", run_id).execute()
+        db.table("strategies").update({"status": "draft"}).eq("id", strategy_id).execute()
 
 
 # ── Endpoints (unchanged contracts) ──────────────────────────────────────────
