@@ -1,8 +1,27 @@
-from typing import Annotated
-from uuid import UUID
-from datetime import datetime
-import logging
+"""
+User-strategy backtest engine ("rules_v2").
 
+Design principles (these are load-bearing — the marketing promises them):
+- Every reported number is computed from the actual trade sequence. Nothing is
+  randomised except the Monte Carlo resampler, which is seeded and reported as such.
+- No silent fallback: if the entry rule can't be compiled or never fires, the run
+  is marked FAILED with an actionable message instead of inventing results.
+- Costs are always on: taker fee + slippage per side, deducted from every trade.
+- No look-ahead: signals are evaluated on bar close, fills happen at next bar open.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import math
+import random
+import re
+from datetime import datetime, timedelta, timezone
+from typing import Annotated, Any, Optional
+from uuid import UUID
+
+import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, status
 from pydantic import BaseModel
 
@@ -12,18 +31,22 @@ from supabase import Client
 
 log = logging.getLogger(__name__)
 
-
-def make_indicator_regex(col_name: str) -> str:
-    """Helper to convert column names like ema_9 to flexible regexes matching 'ema 9', 'ema(9)', or 'ema_9'."""
-    import re
-    parts = re.findall(r'[a-zA-Z]+|\d+', col_name)
-    if not parts:
-        return re.escape(col_name)
-    body = r'\s*[\(_-]?\s*'.join(re.escape(p) for p in parts) + r'\s*\)?'
-    return r'(?<![a-zA-Z0-9])' + body + r'(?![a-zA-Z0-9])'
-
-
 router = APIRouter(prefix="/backtests", tags=["backtests"])
+
+# ── Engine constants ─────────────────────────────────────────────────────────
+ENGINE_VERSION = "rules_v2"
+START_EQUITY = 100.0            # equity is tracked in % terms; UI reads return = equity − 100
+FEE_BPS_PER_SIDE = 10.0         # Binance spot taker 0.10%
+SLIPPAGE_BPS_PER_SIDE = 5.0     # conservative fill assumption
+RISK_PCT_PER_TRADE = 1.0        # risk-based sizing, same model as the v22 research engine
+DEFAULT_SL_ATR_MULT = 1.5
+DEFAULT_TP_R_MULT = 3.0
+WARMUP_BARS = 250               # extra history so 200-period indicators are valid at start
+MAX_BARS = 6_000                # keeps multi-page fetches inside the frontend's poll budget
+MONTE_CARLO_RUNS = 500
+MONTE_CARLO_SEED = 42
+EARLIEST_START = datetime(2017, 1, 1, tzinfo=timezone.utc)
+TF_MINUTES = {"1d": 1440, "4h": 240, "1h": 60}
 
 
 class BacktestRequest(BaseModel):
@@ -32,671 +55,927 @@ class BacktestRequest(BaseModel):
     end_date: str    # "YYYY-MM-DD"
 
 
+class BacktestError(Exception):
+    """Raised for honest, user-facing backtest failures."""
+
+
+# ── Text → rules parsing helpers ─────────────────────────────────────────────
+
+def _normalize_asset(spec: dict) -> str:
+    asset_str = str(spec.get("asset", "BTC/USDT")).upper().strip().replace(" ", "")
+    if "/" not in asset_str:
+        for quote in ("USDT", "USDC", "BUSD"):
+            if asset_str.endswith(quote) and len(asset_str) > len(quote):
+                return f"{asset_str[:-len(quote)]}/{quote}"
+        if asset_str.endswith("BTC") and len(asset_str) > 3:
+            return f"{asset_str[:-3]}/BTC"
+        return f"{asset_str}/USDT"
+    return asset_str
+
+
+def _normalize_timeframe(spec: dict) -> str:
+    tf = str(spec.get("timeframe", "1d")).lower().strip()
+    if tf in ("1d", "d", "daily", "1day"):
+        return "1d"
+    if tf in ("4h", "h4", "4hr", "4 hour", "4hour"):
+        return "4h"
+    if tf in ("1h", "h1", "hourly", "1 hour", "1hour"):
+        return "1h"
+    return "1d"
+
+
+def _find_ma_refs(text: str) -> list[tuple[str, int]]:
+    """Return (ma_type, length) pairs in order of appearance, e.g. 'EMA 9 crosses EMA(21)'."""
+    return [(m.group(1).lower(), int(m.group(2)))
+            for m in re.finditer(r"\b(ema|sma)\s*\(?\s*(\d+)\s*\)?", text, re.IGNORECASE)]
+
+
+DAY_MINUTES = 1440
+RETEST_WAIT_BARS = 15         # how long a breakout waits for its retest before expiring
+RETEST_TOUCH_TOL = 1.002      # a pullback low within 0.2% of the level counts as a touch
+MAX_BREAKOUT_LOOKBACK = 200   # channel lookback capped at the indicator warm-up budget
+
+
+def _parse_entry(entry_text: str, timeframe: str = "1d") -> dict:
+    """
+    Compile the entry rule text into a structured event trigger plus a list of
+    AND-filters (state conditions that must also hold on the signal bar).
+    Raises BacktestError when no testable trigger is found.
+    """
+    t = entry_text.lower()
+    is_short = bool(re.search(r"\b(short|go short|sell short)\b", t))
+    tf_minutes = TF_MINUTES.get(timeframe, DAY_MINUTES)
+
+    trigger: Optional[dict] = None
+    used: set[str] = set()   # concepts consumed by the trigger, excluded from filters
+
+    # ── Breakout above/below an N-day/bar high/low, optionally with retest ──
+    m = re.search(r"break(?:s|out|ing|down)?[^.]*?(\d+)[\s-]*(day|week|bar|candle|period)s?\s*(high|low)", t) \
+        or re.search(r"new\s*(\d+)[\s-]*(day|week|bar|candle|period)s?\s*(high|low)", t)
+    if m:
+        n, unit, band = int(m.group(1)), m.group(2), m.group(3)
+        if unit == "day":
+            lookback = max(2, n * DAY_MINUTES // tf_minutes)
+        elif unit == "week":
+            lookback = max(2, n * 7 * DAY_MINUTES // tf_minutes)
+        else:
+            lookback = max(2, n)
+        lookback = min(lookback, MAX_BREAKOUT_LOOKBACK)
+        retest = bool(re.search(r"\bretest", t))
+        short_break = band == "low"
+        trigger = {
+            "type": "breakout", "lookback": lookback, "band": band, "retest": retest,
+            "is_short": short_break or is_short,
+            "label": f"breakout {'below' if band == 'low' else 'above'} the {n}-{unit} {band}"
+                     + (f" + retest confirmation (touch within {RETEST_WAIT_BARS} bars, close back "
+                        f"{'below' if band == 'low' else 'above'} the level)" if retest else ""),
+        }
+        used.add("breakout")
+
+    has_cross = bool(re.search(r"\bcross(es|ing|over|ed)?\b|golden cross|death cross", t))
+    ma_refs = _find_ma_refs(t)
+
+    # ── MACD / Stochastic crossovers ──
+    if trigger is None and "macd" in t and (has_cross or "signal" in t):
+        trigger = {"type": "macd_cross", "is_short": is_short, "label": "MACD line crossing its signal line"}
+        used.add("macd")
+    if trigger is None and "stoch" in t and has_cross:
+        trigger = {"type": "stoch_cross", "is_short": is_short, "label": "Stochastic %K crossing %D"}
+        used.add("stoch")
+
+    # ── Moving-average crossover ("golden cross", "ema 9 crosses above ema 21") ──
+    if trigger is None and has_cross and len(ma_refs) >= 2:
+        fast = f"{ma_refs[0][0]}_{ma_refs[0][1]}"
+        slow = f"{ma_refs[1][0]}_{ma_refs[1][1]}"
+        trigger = {"type": "ma_cross", "fast": fast, "slow": slow, "is_short": is_short,
+                   "label": f"{fast.upper()} crossing {'below' if is_short else 'above'} {slow.upper()}"}
+        used.add("ma")
+    if trigger is None and ("golden cross" in t or "death cross" in t):
+        ma = "sma" if "sma" in t or "simple" in t else ("ema" if "ema" in t else "sma")
+        short = "death cross" in t and "golden" not in t
+        trigger = {"type": "ma_cross", "fast": f"{ma}_50", "slow": f"{ma}_200", "is_short": short or is_short,
+                   "label": f"{ma.upper()} 50/200 {'death' if short else 'golden'} cross"}
+        used.add("ma")
+
+    # ── RSI threshold crossing ──
+    if trigger is None:
+        m = re.search(r"rsi[^<>]*?(?:(<|<=|below|dips below|under)\s*(\d+))", t)
+        if m:
+            trigger = {"type": "rsi_cross", "level": float(m.group(2)), "direction": "down", "is_short": is_short,
+                       "label": f"RSI crossing below {float(m.group(2)):g}"}
+            used.add("rsi")
+        else:
+            m = re.search(r"rsi[^<>]*?(?:(>|>=|above|rises above|over)\s*(\d+))", t)
+            if m:
+                trigger = {"type": "rsi_cross", "level": float(m.group(2)), "direction": "up", "is_short": is_short,
+                           "label": f"RSI crossing above {float(m.group(2)):g}"}
+                used.add("rsi")
+
+    # ── Bollinger band touch ──
+    if trigger is None and re.search(r"lower (bollinger )?band|bb[_ ]?low|bbl\b", t):
+        trigger = {"type": "bb_touch", "band": "low", "is_short": is_short,
+                   "label": "close touching the lower Bollinger band"}
+        used.add("bb")
+    if trigger is None and re.search(r"upper (bollinger )?band|bb[_ ]?upper|bbu\b", t):
+        trigger = {"type": "bb_touch", "band": "upper", "is_short": is_short,
+                   "label": "close touching the upper Bollinger band"}
+        used.add("bb")
+
+    # ── Price vs MA state transition (last resort, no 'cross' keyword) ──
+    if trigger is None and ma_refs and re.search(r"\b(above|over)\b", t):
+        ma = f"{ma_refs[0][0]}_{ma_refs[0][1]}"
+        trigger = {"type": "price_vs_ma", "ma": ma, "side": "above", "is_short": is_short,
+                   "label": f"close crossing above {ma.upper()}"}
+        used.add("ma")
+    if trigger is None and ma_refs and re.search(r"\b(below|under)\b", t):
+        ma = f"{ma_refs[0][0]}_{ma_refs[0][1]}"
+        trigger = {"type": "price_vs_ma", "ma": ma, "side": "below", "is_short": is_short,
+                   "label": f"close crossing below {ma.upper()}"}
+        used.add("ma")
+
+    if trigger is None:
+        raise BacktestError(
+            "Couldn't compile the entry rule into a testable trigger. "
+            "Try phrasing like 'buy on a breakout above the 20-day high', "
+            "'buy when EMA 9 crosses above EMA 21', or 'buy when RSI drops below 30'."
+        )
+
+    trigger["filters"] = _parse_filters(t, trigger, used)
+    return trigger
+
+
+def _parse_filters(t: str, trigger: dict, used: set[str]) -> list[dict]:
+    """State conditions AND-ed onto the trigger (evaluated on the signal bar)."""
+    filters: list[dict] = []
+
+    # Trend regime ("in an uptrend", "trend.daily == 'up'", "bullish trend")
+    if re.search(r"\buptrend\b|\bbullish\b|trend\.?\w*\s*(?:is|==?)\s*'?up\b|trend\s+(?:is\s+)?up\b", t):
+        filters.append({"type": "price_above_ma", "ma": "sma_200", "label": "uptrend (close above SMA 200)"})
+    elif re.search(r"\bdowntrend\b|\bbearish\b|trend\.?\w*\s*(?:is|==?)\s*'?down\b|trend\s+(?:is\s+)?down\b", t):
+        filters.append({"type": "price_below_ma", "ma": "sma_200", "label": "downtrend (close below SMA 200)"})
+
+    # Explicit "price/close above|below EMA/SMA N"
+    for m in re.finditer(
+            r"(?:price|close(?:s)?|trading|it)\s*(?:is|stays|remains)?\s*(above|over|below|under)\s*(?:the\s*)?(ema|sma)\s*\(?\s*(\d+)\s*\)?", t):
+        direction, ma_type, ln = m.group(1), m.group(2), int(m.group(3))
+        col = f"{ma_type}_{ln}"
+        if trigger.get("type") == "price_vs_ma" and trigger.get("ma") == col:
+            continue  # already the trigger itself
+        ftype = "price_above_ma" if direction in ("above", "over") else "price_below_ma"
+        if not any(f.get("ma") == col and f["type"] == ftype for f in filters):
+            filters.append({"type": ftype, "ma": col, "label": f"close {direction} {ma_type.upper()} {ln}"})
+
+    # "above the 200-day moving average"
+    m = re.search(r"(above|over|below|under)\s*(?:the\s*)?(\d+)[\s-]*day\s*(?:simple\s*|exponential\s*)?(?:ma\b|sma\b|ema\b|moving average)", t)
+    if m:
+        direction, ln = m.group(1), int(m.group(2))
+        col = f"ema_{ln}" if "exponential" in t or re.search(rf"{ln}[\s-]*day\s*ema", t) else f"sma_{ln}"
+        ftype = "price_above_ma" if direction in ("above", "over") else "price_below_ma"
+        if not any(f.get("ma") == col and f["type"] == ftype for f in filters):
+            filters.append({"type": ftype, "ma": col, "label": f"close {direction} the {ln}-day MA"})
+
+    # RSI as a filter when it isn't the trigger
+    if "rsi" not in used:
+        m = re.search(r"rsi[^<>]*?(?:>|>=|above|over)\s*(\d+)", t)
+        if m:
+            filters.append({"type": "rsi_above", "level": float(m.group(1)), "label": f"RSI above {m.group(1)}"})
+        m = re.search(r"rsi[^<>]*?(?:<|<=|below|under)\s*(\d+)", t)
+        if m:
+            filters.append({"type": "rsi_below", "level": float(m.group(1)), "label": f"RSI below {m.group(1)}"})
+
+    # Volume confirmation
+    if re.search(r"volume\s*(?:is\s*)?(?:above|over|greater|spike|surge|elevated|high(?:er)?)", t):
+        filters.append({"type": "volume_above_avg", "label": "volume above its 20-bar average"})
+
+    return filters
+
+
+def _parse_exit(exit_text: str, entry: dict) -> dict:
+    """Optional rule-based exits layered on top of the stop/target."""
+    t = exit_text.lower()
+    out: dict[str, Any] = {}
+
+    m = re.search(r"rsi[^<>]*?(?:>|>=|above|rises above|over)\s*(\d+)", t)
+    if m:
+        out["rsi_above"] = float(m.group(1))
+    m = re.search(r"rsi[^<>]*?(?:<|<=|below|dips below|under)\s*(\d+)", t)
+    if m:
+        out["rsi_below"] = float(m.group(1))
+
+    ma_refs = _find_ma_refs(t)
+    if ma_refs and re.search(r"\b(below|under|cross(es|ing)? below)\b", t):
+        out["close_below_ma"] = f"{ma_refs[0][0]}_{ma_refs[0][1]}"
+    elif ma_refs and re.search(r"\b(above|over|cross(es|ing)? above)\b", t):
+        out["close_above_ma"] = f"{ma_refs[0][0]}_{ma_refs[0][1]}"
+
+    if entry.get("type") == "ma_cross" and re.search(r"\b(opposite|reverse|cross(es|ing)? back)\b", t):
+        out["opposite_cross"] = True
+
+    m = re.search(r"(?:after|within|max(?:imum)?)\s*(\d+)\s*(bar|bars|candle|candles|day|days)", t)
+    if m:
+        out["max_bars_held"] = int(m.group(1))
+
+    return out
+
+
+def _parse_stop(sl_text: str, rules_text: str, entry: Optional[dict] = None) -> dict:
+    """
+    Stop distance: 'n * ATR', 'n %', or 'the retest low' (breakout+retest only).
+    Any mention of 'trailing' upgrades the ATR stop to a ratcheting trail.
+    Falls back to a stated default.
+    """
+    combined = f"{sl_text} {rules_text}".lower()
+    trailing = bool(re.search(r"\btrail", combined))
+    trail_mult = DEFAULT_SL_ATR_MULT
+    m = re.search(r"(\d+(?:\.\d+)?)\s*[*x]?\s*atr", combined)
+    if m:
+        trail_mult = float(m.group(1))
+
+    stop: dict[str, Any]
+    if entry and entry.get("type") == "breakout" and entry.get("retest") and re.search(r"retest\s*(?:bar|candle)?'?s?\s*low", combined):
+        stop = {"mode": "retest_low", "mult": trail_mult, "label": "the retest bar's low"}
+    else:
+        found = False
+        for source in (sl_text, rules_text):
+            t = source.lower()
+            m = re.search(r"(\d+(?:\.\d+)?)\s*[*x]?\s*atr", t)
+            if m:
+                stop = {"mode": "atr", "mult": float(m.group(1)), "label": f"{float(m.group(1)):g} × ATR(14)"}
+                found = True
+                break
+            m = re.search(r"(\d+(?:\.\d+)?)\s*%", t)
+            if m:
+                stop = {"mode": "pct", "pct": float(m.group(1)), "label": f"{float(m.group(1)):g}% fixed"}
+                found = True
+                break
+        if not found:
+            stop = {"mode": "atr", "mult": DEFAULT_SL_ATR_MULT,
+                    "label": f"{DEFAULT_SL_ATR_MULT:g} × ATR(14) (default — no stop rule found)"}
+
+    stop["trailing"] = trailing
+    stop["trail_mult"] = trail_mult
+    if trailing:
+        stop["label"] += f", trailing at {trail_mult:g} × ATR(14)"
+    return stop
+
+
+def _parse_target(tp_text: str) -> dict:
+    """Target: 'nR' or 'n %'. Falls back to a stated default."""
+    t = tp_text.lower()
+    m = re.search(r"(\d+(?:\.\d+)?)\s*[*x]?\s*r\b", t)
+    if m:
+        return {"mode": "r", "mult": float(m.group(1)), "label": f"{float(m.group(1)):g}R"}
+    m = re.search(r"(\d+(?:\.\d+)?)\s*%", t)
+    if m:
+        return {"mode": "pct", "pct": float(m.group(1)), "label": f"{float(m.group(1)):g}% fixed"}
+    return {"mode": "r", "mult": DEFAULT_TP_R_MULT,
+            "label": f"{DEFAULT_TP_R_MULT:g}R (default — no target rule found)"}
+
+
+# ── Indicators ───────────────────────────────────────────────────────────────
+
+def _compute_indicators(df: pd.DataFrame, spec: dict, source_prompt: str) -> pd.DataFrame:
+    import pandas_ta as ta
+
+    df = df.copy()
+    df["sma_50"] = ta.sma(df["close"], length=50)
+    df["sma_200"] = ta.sma(df["close"], length=200)
+    df["ema_21"] = ta.ema(df["close"], length=21)
+    df["ema_50"] = ta.ema(df["close"], length=50)
+    df["ema_200"] = ta.ema(df["close"], length=200)
+    df["rsi"] = ta.rsi(df["close"], length=14)
+    df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=14)
+    df["vol_sma20"] = ta.sma(df["volume"], length=20)
+
+    bb = ta.bbands(df["close"], length=20, std=2.0)
+    if bb is not None and not bb.empty:
+        bbl = next((c for c in bb.columns if c.startswith("BBL_")), None)
+        bbm = next((c for c in bb.columns if c.startswith("BBM_")), None)
+        bbu = next((c for c in bb.columns if c.startswith("BBU_")), None)
+        if bbl and bbm and bbu:
+            df["bb_low"] = bb[bbl]
+            df["bb_mid"] = bb[bbm]
+            df["bb_upper"] = bb[bbu]
+
+    macd = ta.macd(df["close"])
+    if macd is not None and not macd.empty:
+        for col in macd.columns:
+            cl = col.lower()
+            if cl.startswith("macd_"):
+                df["macd_line"] = macd[col]
+            elif cl.startswith("macds_"):
+                df["macd_signal"] = macd[col]
+    stoch = ta.stoch(df["high"], df["low"], df["close"])
+    if stoch is not None and not stoch.empty:
+        for col in stoch.columns:
+            cl = col.lower()
+            if cl.startswith("stochk_"):
+                df["stoch_k"] = stoch[col]
+            elif cl.startswith("stochd_"):
+                df["stoch_d"] = stoch[col]
+
+    # Any explicitly-referenced MA lengths not covered by the defaults
+    rules_text = " ".join(str(spec.get(k, "") or "") for k in ("entry", "exit", "stop_loss", "target"))
+    for ma_type, length in _find_ma_refs(f"{rules_text} {source_prompt}"):
+        col = f"{ma_type}_{length}"
+        if col not in df.columns:
+            df[col] = ta.sma(df["close"], length=length) if ma_type == "sma" else ta.ema(df["close"], length=length)
+
+    return df
+
+
+def _ensure_rule_columns(df: pd.DataFrame, entry: dict, exits: dict) -> pd.DataFrame:
+    """Compute any columns the compiled rules reference that the defaults missed."""
+    import pandas_ta as ta
+
+    needed: list[str] = []
+    if entry["type"] == "ma_cross":
+        needed += [entry["fast"], entry["slow"]]
+    if entry["type"] == "price_vs_ma":
+        needed.append(entry["ma"])
+    for f in entry.get("filters", []):
+        if "ma" in f:
+            needed.append(f["ma"])
+    for key in ("close_below_ma", "close_above_ma"):
+        if key in exits:
+            needed.append(exits[key])
+
+    for col in needed:
+        if col not in df.columns:
+            ma_type, ln = col.split("_")
+            fn = ta.sma if ma_type == "sma" else ta.ema
+            df[col] = fn(df["close"], length=int(ln))
+
+    if entry["type"] == "breakout":
+        n = entry["lookback"]
+        # channel of the PRIOR n bars — shift(1) keeps the current bar out of its own level
+        df[f"hh_{n}"] = df["high"].rolling(n).max().shift(1)
+        df[f"ll_{n}"] = df["low"].rolling(n).min().shift(1)
+
+    return df
+
+
+# ── Core simulation ──────────────────────────────────────────────────────────
+
+def _isnan(v) -> bool:
+    try:
+        return v is None or math.isnan(float(v))
+    except (TypeError, ValueError):
+        return True
+
+
+def _filters_pass(filters: list[dict], row: pd.Series) -> bool:
+    """All AND-filters must hold on the signal bar."""
+    for f in filters:
+        ftype = f["type"]
+        if ftype in ("price_above_ma", "price_below_ma"):
+            vals = (row.get("close"), row.get(f["ma"]))
+            if any(_isnan(v) for v in vals):
+                return False
+            c, ma = map(float, vals)
+            if ftype == "price_above_ma" and not c > ma:
+                return False
+            if ftype == "price_below_ma" and not c < ma:
+                return False
+        elif ftype in ("rsi_above", "rsi_below"):
+            if _isnan(row.get("rsi")):
+                return False
+            r = float(row["rsi"])
+            if ftype == "rsi_above" and not r > f["level"]:
+                return False
+            if ftype == "rsi_below" and not r < f["level"]:
+                return False
+        elif ftype == "volume_above_avg":
+            vals = (row.get("volume"), row.get("vol_sma20"))
+            if any(_isnan(v) for v in vals):
+                return False
+            if not float(row["volume"]) > float(row["vol_sma20"]):
+                return False
+    return True
+
+
+def _entry_signal(entry: dict, row: pd.Series, prev: pd.Series) -> bool:
+    etype = entry["type"]
+    if etype == "breakout":
+        col = f"hh_{entry['lookback']}" if entry["band"] == "high" else f"ll_{entry['lookback']}"
+        vals = (row.get("close"), row.get(col), prev.get("close"), prev.get(col))
+        if any(_isnan(v) for v in vals):
+            return False
+        c, lvl, pc, plvl = map(float, vals)
+        if entry["band"] == "high":
+            return c > lvl and pc <= plvl
+        return c < lvl and pc >= plvl
+    if etype == "ma_cross":
+        vals = (row.get(entry["fast"]), row.get(entry["slow"]), prev.get(entry["fast"]), prev.get(entry["slow"]))
+        if any(_isnan(v) for v in vals):
+            return False
+        f, s, pf, ps = map(float, vals)
+        return (f < s and pf >= ps) if entry["is_short"] else (f > s and pf <= ps)
+    if etype == "macd_cross":
+        vals = (row.get("macd_line"), row.get("macd_signal"), prev.get("macd_line"), prev.get("macd_signal"))
+        if any(_isnan(v) for v in vals):
+            return False
+        m, sig, pm, psig = map(float, vals)
+        return (m < sig and pm >= psig) if entry["is_short"] else (m > sig and pm <= psig)
+    if etype == "stoch_cross":
+        vals = (row.get("stoch_k"), row.get("stoch_d"), prev.get("stoch_k"), prev.get("stoch_d"))
+        if any(_isnan(v) for v in vals):
+            return False
+        k, d, pk, pd_ = map(float, vals)
+        return (k < d and pk >= pd_) if entry["is_short"] else (k > d and pk <= pd_)
+    if etype == "rsi_cross":
+        vals = (row.get("rsi"), prev.get("rsi"))
+        if any(_isnan(v) for v in vals):
+            return False
+        r, pr = map(float, vals)
+        lvl = entry["level"]
+        return (r < lvl and pr >= lvl) if entry["direction"] == "down" else (r > lvl and pr <= lvl)
+    if etype == "bb_touch":
+        band = "bb_low" if entry["band"] == "low" else "bb_upper"
+        vals = (row.get("close"), row.get(band))
+        if any(_isnan(v) for v in vals):
+            return False
+        c, b = map(float, vals)
+        return c >= b if entry["band"] == "upper" else c <= b
+    if etype == "price_vs_ma":
+        vals = (row.get("close"), row.get(entry["ma"]), prev.get("close"), prev.get(entry["ma"]))
+        if any(_isnan(v) for v in vals):
+            return False
+        c, ma, pc, pma = map(float, vals)
+        return (c > ma and pc <= pma) if entry["side"] == "above" else (c < ma and pc >= pma)
+    return False
+
+
+def _rule_exit_signal(exits: dict, entry: dict, row: pd.Series, prev: pd.Series) -> Optional[str]:
+    if "rsi_above" in exits and not _isnan(row.get("rsi")) and float(row["rsi"]) > exits["rsi_above"]:
+        return f"rsi>{exits['rsi_above']:g}"
+    if "rsi_below" in exits and not _isnan(row.get("rsi")) and float(row["rsi"]) < exits["rsi_below"]:
+        return f"rsi<{exits['rsi_below']:g}"
+    if "close_below_ma" in exits:
+        ma = exits["close_below_ma"]
+        if not _isnan(row.get(ma)) and float(row["close"]) < float(row[ma]):
+            return f"close<{ma}"
+    if "close_above_ma" in exits:
+        ma = exits["close_above_ma"]
+        if not _isnan(row.get(ma)) and float(row["close"]) > float(row[ma]):
+            return f"close>{ma}"
+    if exits.get("opposite_cross") and entry.get("type") == "ma_cross":
+        flipped = dict(entry, is_short=not entry["is_short"])
+        if _entry_signal(flipped, row, prev):
+            return "opposite_cross"
+    return None
+
+
+def _max_drawdown_pct(equity_points: list[float]) -> float:
+    peak = -float("inf")
+    max_dd = 0.0
+    for eq in equity_points:
+        peak = max(peak, eq)
+        if peak > 0:
+            max_dd = min(max_dd, (eq - peak) / peak * 100.0)
+    return round(abs(max_dd), 2)
+
+
+def _simulate(df: pd.DataFrame, entry: dict, exits: dict, stop: dict, target: dict,
+              start_ts: pd.Timestamp) -> tuple[list[dict], list[list[float]]]:
+    """
+    Bar-by-bar simulation. Signals evaluate on bar close; fills at next bar open.
+    Returns (trades, equity_curve). Trades carry internal fields (_gross_pct,
+    _pos_frac, _f) used by the stats layer and stripped before persistence.
+    """
+    cost_pct = 2 * (FEE_BPS_PER_SIDE + SLIPPAGE_BPS_PER_SIDE) / 100.0  # round-trip, in %
+    equity = START_EQUITY
+    trades: list[dict] = []
+    equity_curve: list[list[float]] = [[int(start_ts.timestamp() * 1000), START_EQUITY]]
+
+    filters = entry.get("filters", [])
+    pending: Optional[dict] = None   # armed breakout awaiting its retest
+
+    in_pos = False
+    side = "LONG"
+    entry_price = stop_price = target_price = sl_dist_pct = 0.0
+    entry_ts_ms = 0
+    entry_date_str = ""
+    bars_held = 0
+
+    start_idx = int(df["timestamp"].searchsorted(start_ts))
+    n = len(df)
+
+    for i in range(max(start_idx, 1), n):
+        row, prev = df.iloc[i], df.iloc[i - 1]
+
+        if in_pos:
+            bars_held += 1
+            o, h, l, c = (float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"]))
+            exit_price = None
+            exit_reason = ""
+            if side == "LONG":
+                if o <= stop_price:
+                    exit_price, exit_reason = o, "gap_stop"
+                elif l <= stop_price:
+                    exit_price, exit_reason = stop_price, "stop_loss"
+                elif o >= target_price:
+                    exit_price, exit_reason = o, "gap_target"
+                elif h >= target_price:
+                    exit_price, exit_reason = target_price, "take_profit"
+            else:
+                if o >= stop_price:
+                    exit_price, exit_reason = o, "gap_stop"
+                elif h >= stop_price:
+                    exit_price, exit_reason = stop_price, "stop_loss"
+                elif o <= target_price:
+                    exit_price, exit_reason = o, "gap_target"
+                elif l <= target_price:
+                    exit_price, exit_reason = target_price, "take_profit"
+
+            if exit_price is None:
+                reason = _rule_exit_signal(exits, entry, row, prev)
+                if reason:
+                    exit_price, exit_reason = c, reason
+                elif exits.get("max_bars_held") and bars_held >= exits["max_bars_held"]:
+                    exit_price, exit_reason = c, "timeout"
+                elif i == n - 1:
+                    exit_price, exit_reason = c, "end_of_data"
+
+            if exit_price is None and stop.get("trailing"):
+                # Ratchet the trail on the bar close — never loosens, only tightens
+                atr_now = float(row["atr"]) if not _isnan(row.get("atr")) and float(row["atr"]) > 0 else None
+                if atr_now:
+                    if side == "LONG":
+                        stop_price = max(stop_price, c - stop["trail_mult"] * atr_now)
+                    else:
+                        stop_price = min(stop_price, c + stop["trail_mult"] * atr_now)
+
+            if exit_price is not None:
+                if stop.get("trailing") and exit_reason in ("stop_loss", "gap_stop"):
+                    exit_reason = "trail_stop"
+                gross_pct = ((exit_price - entry_price) / entry_price * 100.0) * (1 if side == "LONG" else -1)
+                net_pct = gross_pct - cost_pct
+                # risk-based sizing: risk RISK_PCT of equity, position capped at equity (spot)
+                pos_frac = min(RISK_PCT_PER_TRADE / sl_dist_pct, 1.0) if sl_dist_pct > 0 else 0.25
+                equity_before = equity
+                pnl = equity_before * pos_frac * net_pct / 100.0
+                equity = max(equity + pnl, 0.01)
+                r_actual = net_pct / sl_dist_pct if sl_dist_pct > 0 else 0.0
+                f = pnl / equity_before if equity_before > 0 else 0.0
+
+                ts_ms = int(row["timestamp"].timestamp() * 1000)
+                equity_curve.append([ts_ms, round(equity, 2)])
+                sign = "+" if r_actual >= 0 else "−"
+                trades.append({
+                    "date": row["timestamp"].strftime("%Y-%m-%d"),
+                    "side": side,
+                    "entry": round(entry_price, 6),
+                    "exit": round(exit_price, 6),
+                    "r": f"{sign}{abs(r_actual):.1f}R",
+                    "pos": net_pct > 0,
+                    "pnl_pct": round(net_pct, 2),
+                    "exit_reason": exit_reason,
+                    "entry_date": entry_date_str,
+                    "entry_ts": entry_ts_ms,
+                    "exit_ts": ts_ms,
+                    "stop": round(stop_price, 6),
+                    "target": round(target_price, 6),
+                    "_gross_pct": gross_pct,
+                    "_pos_frac": pos_frac,
+                    "_f": f,
+                })
+                in_pos = False
+            continue
+
+        # Flat: look for an entry signal on this close, fill at next open
+        if i >= n - 1:
+            break
+
+        signal = False
+        retest_extreme: Optional[float] = None
+        if entry["type"] == "breakout" and entry.get("retest"):
+            # Two-stage: a breakout arms a pending setup; price pulling back to
+            # touch the broken level and closing back on the breakout side confirms.
+            if pending is None:
+                if _entry_signal(entry, row, prev) and _filters_pass(filters, row):
+                    col = f"hh_{entry['lookback']}" if entry["band"] == "high" else f"ll_{entry['lookback']}"
+                    lvl = float(row[col])
+                    atr_now = float(row["atr"]) if not _isnan(row.get("atr")) and float(row["atr"]) > 0 else lvl * 0.02
+                    pending = {"level": lvl, "deadline": i + RETEST_WAIT_BARS, "atr": atr_now}
+            else:
+                lvl = pending["level"]
+                c_now = float(row["close"])
+                if entry["band"] == "high":
+                    touched = float(row["low"]) <= lvl * RETEST_TOUCH_TOL and c_now >= lvl
+                    invalidated = c_now < lvl - pending["atr"]
+                    extreme = float(row["low"])
+                else:
+                    touched = float(row["high"]) >= lvl / RETEST_TOUCH_TOL and c_now <= lvl
+                    invalidated = c_now > lvl + pending["atr"]
+                    extreme = float(row["high"])
+                if touched:
+                    signal = True
+                    retest_extreme = extreme
+                    pending = None
+                elif invalidated or i >= pending["deadline"]:
+                    pending = None
+        else:
+            signal = _entry_signal(entry, row, prev) and _filters_pass(filters, row)
+
+        if signal:
+            nxt = df.iloc[i + 1]
+            fill = float(nxt["open"])
+            atr_val = float(row["atr"]) if not _isnan(row.get("atr")) and float(row["atr"]) > 0 else fill * 0.02
+
+            if stop["mode"] == "retest_low" and retest_extreme is not None:
+                sl_dist = (fill - retest_extreme) if not entry["is_short"] else (retest_extreme - fill)
+                if sl_dist <= 0:  # retest bar's extreme is on the wrong side of the fill — fall back
+                    sl_dist = stop["mult"] * atr_val
+            elif stop["mode"] == "atr" or stop["mode"] == "retest_low":
+                sl_dist = stop["mult"] * atr_val
+            else:
+                sl_dist = fill * stop["pct"] / 100.0
+            sl_dist_pct = sl_dist / fill * 100.0
+
+            if target["mode"] == "r":
+                tp_dist = target["mult"] * sl_dist
+            else:
+                tp_dist = fill * target["pct"] / 100.0
+
+            side = "SHORT" if entry["is_short"] else "LONG"
+            entry_price = fill
+            entry_ts_ms = int(nxt["timestamp"].timestamp() * 1000)
+            entry_date_str = nxt["timestamp"].strftime("%Y-%m-%d")
+            if side == "LONG":
+                stop_price, target_price = fill - sl_dist, fill + tp_dist
+            else:
+                stop_price, target_price = fill + sl_dist, fill - tp_dist
+            in_pos = True
+            bars_held = 0
+
+    return trades, equity_curve
+
+
+# ── Stats (every number computed, none invented) ─────────────────────────────
+
+def _build_stats(trades: list[dict], equity_curve: list[list[float]],
+                 start_dt: datetime, end_dt: datetime) -> dict:
+    n = len(trades)
+    wins = sum(1 for t in trades if t["pos"])
+    final_equity = equity_curve[-1][1]
+    total_return_pct = round(final_equity - START_EQUITY, 1)
+
+    equity_values = [p[1] for p in equity_curve]
+    max_dd = _max_drawdown_pct(equity_values)
+
+    # Trade-based Sharpe, annualised by observed trade frequency
+    fs = [t["_f"] for t in trades]
+    years = max((end_dt - start_dt).days / 365.25, 1 / 365.25)
+    sharpe = 0.0
+    if n >= 2:
+        mean_f = sum(fs) / n
+        var = sum((x - mean_f) ** 2 for x in fs) / (n - 1)
+        std = math.sqrt(var)
+        if std > 0:
+            sharpe = round(mean_f / std * math.sqrt(n / years), 2)
+
+    pnl_dollars = [(equity_curve[i + 1][1] - equity_curve[i][1]) for i in range(len(equity_curve) - 1)]
+    gross_profit = sum(p for p in pnl_dollars if p > 0)
+    gross_loss = abs(sum(p for p in pnl_dollars if p < 0))
+    profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else 9.99
+
+    # Yearly breakdown from the actual equity path
+    yearly = []
+    by_year: dict[int, list[int]] = {}
+    for idx, t in enumerate(trades):
+        by_year.setdefault(int(t["date"][:4]), []).append(idx)
+    running_equity = START_EQUITY
+    for yr in sorted(by_year):
+        idxs = by_year[yr]
+        yr_start_eq = running_equity
+        yr_points = [yr_start_eq] + [equity_curve[i + 1][1] for i in idxs]
+        yr_wins = sum(1 for i in idxs if trades[i]["pos"])
+        running_equity = yr_points[-1]
+        yearly.append({
+            "year": yr,
+            "trades_count": len(idxs),
+            "return_pct": round((yr_points[-1] / yr_start_eq - 1) * 100.0, 1),
+            "drawdown_pct": _max_drawdown_pct(yr_points),
+            "win_rate_pct": round(yr_wins / len(idxs) * 100.0, 1),
+        })
+
+    # Monte Carlo: reshuffle the observed trade returns, measure drawdown dispersion
+    rng = random.Random(MONTE_CARLO_SEED)
+    mc_dds = []
+    if n >= 5:
+        for _ in range(MONTE_CARLO_RUNS):
+            seq = fs[:]
+            rng.shuffle(seq)
+            eq = START_EQUITY
+            points = [eq]
+            for f in seq:
+                eq = max(eq * (1 + f), 0.01)
+                points.append(eq)
+            mc_dds.append(_max_drawdown_pct(points))
+        mc_dds.sort()
+    monte_carlo = {
+        "runs": len(mc_dds) and MONTE_CARLO_RUNS,
+        "median_max_dd_pct": mc_dds[len(mc_dds) // 2] if mc_dds else None,
+        "p95_max_dd_pct": mc_dds[int(len(mc_dds) * 0.95)] if mc_dds else None,
+        "note": "Trade order reshuffled; measures how much of the drawdown figure is sequence luck.",
+    }
+
+    # Cost stress: double fees + slippage, replay the same trades
+    stressed_cost_pct = 2 * 2 * (FEE_BPS_PER_SIDE + SLIPPAGE_BPS_PER_SIDE) / 100.0
+    eq = START_EQUITY
+    for t in trades:
+        net = t["_gross_pct"] - stressed_cost_pct
+        eq = max(eq + eq * t["_pos_frac"] * net / 100.0, 0.01)
+    stress = {
+        "assumption": "fees + slippage doubled (0.60% round trip)",
+        "stressed_return_pct": round(eq - START_EQUITY, 1),
+    }
+
+    trades_out = [{k: v for k, v in t.items() if not k.startswith("_")} for t in trades]
+    trades_out.reverse()   # UI expects newest first
+    yearly.reverse()
+
+    return {
+        "win_rate_pct": round(wins / n * 100.0, 1),
+        "sharpe_ratio": sharpe,
+        "max_drawdown_pct": max_dd,
+        "profit_factor": profit_factor,
+        "trade_count": n,
+        "total_return_pct": total_return_pct,
+        "equity_curve": equity_curve,
+        "trades": trades_out,
+        "yearly_breakdown": yearly,
+        "monte_carlo": monte_carlo,
+        "cost_stress": stress,
+    }
+
+
+# ── Background task ──────────────────────────────────────────────────────────
+
+def _run_backtest_sync(spec: dict, source_prompt: str, start_date: str, end_date: str) -> dict:
+    """Pure computation — raises BacktestError with a user-facing message on failure."""
+    from app.v22.exchange import fetch_ohlcv_range
+
+    # 1. Window
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise BacktestError("Invalid date range — expected YYYY-MM-DD.")
+    now = datetime.now(timezone.utc)
+    start_dt = max(start_dt, EARLIEST_START)
+    end_dt = min(end_dt, now)
+    if start_dt >= end_dt:
+        raise BacktestError("Start date must be before end date.")
+
+    # 2. Timeframe — drop to daily when the window would exceed the bar budget
+    timeframe = _normalize_timeframe(spec)
+    range_minutes = (end_dt - start_dt).total_seconds() / 60
+    if range_minutes / TF_MINUTES[timeframe] > MAX_BARS:
+        timeframe = "1d"
+    tf_minutes = TF_MINUTES[timeframe]
+
+    # 3. Rules
+    entry = _parse_entry(str(spec.get("entry", "") or ""), timeframe)
+    exits = _parse_exit(str(spec.get("exit", "") or ""), entry)
+    stop = _parse_stop(str(spec.get("stop_loss", "") or ""),
+                       " ".join(str(spec.get(k, "") or "") for k in ("entry", "exit", "target")),
+                       entry)
+    target = _parse_target(str(spec.get("target", "") or ""))
+
+    # 4. Data (with indicator warm-up)
+    asset = _normalize_asset(spec)
+    since_ms = int((start_dt - timedelta(minutes=WARMUP_BARS * tf_minutes)).timestamp() * 1000)
+    until_ms = int(end_dt.timestamp() * 1000)
+    df = fetch_ohlcv_range(asset, timeframe, since_ms, until_ms)
+    if df.empty or len(df) < 60:
+        raise BacktestError(f"Not enough historical data for {asset} on {timeframe} in the requested window.")
+
+    df = _compute_indicators(df, spec, source_prompt or "")
+    df = _ensure_rule_columns(df, entry, exits)
+
+    entry_label = entry["label"]
+    if entry.get("filters"):
+        entry_label += " — filters: " + ", ".join(f["label"] for f in entry["filters"])
+
+    # 5. Simulate
+    start_ts = pd.Timestamp(start_dt)
+    trades, equity_curve = _simulate(df, entry, exits, stop, target, start_ts)
+    if not trades:
+        data_start = df["timestamp"].iloc[0].date()
+        raise BacktestError(
+            f"No trades triggered: '{entry_label}' never fired on {asset} ({timeframe}) "
+            f"between {max(start_dt.date(), data_start)} and {end_dt.date()}. "
+            "Loosen the entry rule or widen the date range."
+        )
+
+    # 6. Stats
+    stats = _build_stats(trades, equity_curve, start_dt, end_dt)
+    stats["engine"] = ENGINE_VERSION
+    stats["params_used"] = {
+        "asset": asset,
+        "timeframe": timeframe,
+        "entry": entry_label,
+        "direction": "SHORT" if entry["is_short"] else "LONG",
+        "stop_loss": stop["label"],
+        "target": target["label"],
+        "rule_exits": {k: v for k, v in exits.items()} or None,
+        "sizing": f"{RISK_PCT_PER_TRADE:g}% equity risk per trade, position capped at 100% (spot, no leverage)",
+        "costs": f"{FEE_BPS_PER_SIDE:g} bps fee + {SLIPPAGE_BPS_PER_SIDE:g} bps slippage per side",
+        "fills": "signal on bar close, fill at next bar open; stop checked before target within a bar",
+        "data_start": str(df["timestamp"].iloc[0].date()),
+        "data_end": str(df["timestamp"].iloc[-1].date()),
+        "bars": len(df),
+    }
+    return stats
+
+
+CHART_PAD_BARS = 12       # context candles on each side of the trade
+CHART_MAX_CANDLES = 400   # stride-sample beyond this to keep the payload light
+
+
+def _trade_chart_payload(stats: dict, spec: dict, trade_index: int) -> dict:
+    """Build the OHLC context payload for one backtested trade. Raises BacktestError."""
+    from app.v22.exchange import fetch_ohlcv_range
+
+    trades = stats.get("trades") or []
+    if not (0 <= trade_index < len(trades)):
+        raise BacktestError("Trade not found in this backtest run.")
+    trade = trades[trade_index]
+
+    params = stats.get("params_used") or {}
+    asset = params.get("asset") or _normalize_asset(spec or {})
+    timeframe = params.get("timeframe") or "1d"
+    tf_minutes = TF_MINUTES.get(timeframe, 1440)
+    tf_ms = tf_minutes * 60_000
+
+    exit_ts = trade.get("exit_ts")
+    if not exit_ts:
+        exit_dt = datetime.strptime(trade["date"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        exit_ts = int(exit_dt.timestamp() * 1000)
+    entry_ts = trade.get("entry_ts")
+    approx_entry = not bool(entry_ts)
+    if not entry_ts:
+        # Legacy runs didn't record the entry bar — assume a ~20-bar hold for framing.
+        entry_ts = exit_ts - 20 * tf_ms
+
+    since_ms = entry_ts - CHART_PAD_BARS * tf_ms
+    until_ms = min(exit_ts + CHART_PAD_BARS * tf_ms, int(datetime.now(timezone.utc).timestamp() * 1000))
+    df = fetch_ohlcv_range(asset, timeframe, since_ms, until_ms)
+    if df.empty:
+        raise BacktestError(f"No historical candles available for {asset} around this trade.")
+
+    ts_ms = (df["timestamp"].astype("int64") // 10**6).tolist()
+    candles = [
+        [ts_ms[i], float(df["open"].iloc[i]), float(df["high"].iloc[i]),
+         float(df["low"].iloc[i]), float(df["close"].iloc[i])]
+        for i in range(len(df))
+    ]
+    if len(candles) > CHART_MAX_CANDLES:
+        stride = math.ceil(len(candles) / CHART_MAX_CANDLES)
+        candles = candles[::stride]
+
+    return {
+        "asset": asset,
+        "timeframe": timeframe,
+        "candles": candles,
+        "trade": {k: v for k, v in trade.items() if not k.startswith("_")},
+        "entry_ts": entry_ts,
+        "exit_ts": exit_ts,
+        "approx_entry": approx_entry,
+    }
+
+
 async def _run_backtest(run_id: str, strategy_id: str, start_date: str, end_date: str, db: Client) -> None:
-    """
-    Background task: marks run as running, simulates walk-forward execution,
-    models realistic high-fidelity quantitative metrics dynamically, and records results.
-    """
     try:
         db.table("backtest_runs").update({"status": "running"}).eq("id", run_id).execute()
 
-        import asyncio
-        import random
-        import time
-
-        # Simulate quantitative backtesting engine calculations
-        await asyncio.sleep(1.8)
-
-        # Fetch strategy spec and original source prompt
         strat_res = db.table("strategies").select("spec, source_prompt").eq("id", strategy_id).single().execute()
-        spec = strat_res.data.get("spec") if strat_res.data else {}
-        source_prompt = strat_res.data.get("source_prompt") if strat_res.data else ""
+        spec = (strat_res.data or {}).get("spec") or {}
+        source_prompt = (strat_res.data or {}).get("source_prompt") or ""
 
-        # Determine target asset and format for Binance ccxt
-        asset_str = str(spec.get("asset", "BTC/USDT")).upper().strip()
-        asset_str = asset_str.replace(" ", "")
-        if "/" not in asset_str:
-            if asset_str.endswith("USDT") and len(asset_str) > 4:
-                asset_str = f"{asset_str[:-4]}/USDT"
-            elif asset_str.endswith("USDC") and len(asset_str) > 4:
-                asset_str = f"{asset_str[:-4]}/USDC"
-            elif asset_str.endswith("BUSD") and len(asset_str) > 4:
-                asset_str = f"{asset_str[:-4]}/BUSD"
-            elif asset_str.endswith("BTC") and len(asset_str) > 3:
-                asset_str = f"{asset_str[:-3]}/BTC"
-            else:
-                asset_str = f"{asset_str}/USDT"
-
-        import asyncio
-        import random
-        import time
-        from datetime import datetime, timedelta
-        import pandas as pd
-        import pandas_ta as ta
-        from app.v22.exchange import fetch_ohlcv
-
-        real_backtest_success = False
-        trades = []
-        equity_curve = []
-        yearly_breakdown = []
-        equity_val = 100.0
-
-        try:
-            # Let the simulator progress bar move realistically on frontend
-            await asyncio.sleep(1.5)
-
-            # Fetch daily data using the server's existing exchange data cache
-            df = fetch_ohlcv(symbol=asset_str, timeframe="1d", limit=1500)
-            if not df.empty and len(df) > 100:
-                # Add default technical indicators
-                df["sma_50"] = ta.sma(df["close"], length=50)
-                df["sma_200"] = ta.sma(df["close"], length=200)
-                df["ema_21"] = ta.ema(df["close"], length=21)
-                df["ema_50"] = ta.ema(df["close"], length=50)
-                df["ema_200"] = ta.ema(df["close"], length=200)
-                df["rsi"] = ta.rsi(df["close"], length=14)
-                df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=14)
-                
-                bb = ta.bbands(df["close"], length=20, std=2.0)
-                if bb is not None and not bb.empty:
-                    bbl = next((c for c in bb.columns if c.startswith("BBL_")), None)
-                    bbm = next((c for c in bb.columns if c.startswith("BBM_")), None)
-                    bbu = next((c for c in bb.columns if c.startswith("BBU_")), None)
-                    if bbl and bbm and bbu:
-                        df["bb_low"] = bb[bbl]
-                        df["bb_mid"] = bb[bbm]
-                        df["bb_upper"] = bb[bbu]
-
-                # Dynamically download / calculate custom indicators requested in the spec or prompt text
-                def calculate_custom_indicator(df_in: pd.DataFrame, ind_str: str) -> pd.DataFrame:
-                    """Dynamically parses and calculates any technical indicator from pandas_ta."""
-                    import inspect
-                    df_in = df_in.copy()
-                    ind_str = ind_str.strip().lower()
-                    
-                    match = re.match(r"^([a-zA-Z_0-9]+)(?:\s*\(?\s*([^)]*)\s*\)?)?", ind_str)
-                    if not match:
-                        return df_in
-                        
-                    name = match.group(1)
-                    args_str = match.group(2) or ""
-                    
-                    func = None
-                    if hasattr(ta, name):
-                        func = getattr(ta, name)
-                    elif hasattr(df_in.ta, name):
-                        func = getattr(df_in.ta, name)
-                    else:
-                        aliases = {
-                            "sma": ta.sma, "ema": ta.ema, "rsi": ta.rsi, "atr": ta.atr,
-                            "macd": ta.macd, "stoch": ta.stoch, "bb": ta.bbands, "bollinger": ta.bbands,
-                            "bands": ta.bbands, "cci": ta.cci, "adx": ta.adx, "supertrend": ta.supertrend,
-                            "willr": ta.willr, "trix": ta.trix, "obv": ta.obv, "vwap": ta.vwap,
-                            "mom": ta.mom, "std": ta.stdev, "stdev": ta.stdev, "variance": ta.variance
-                        }
-                        func = aliases.get(name)
-                        
-                    if not func:
-                        for attr in dir(ta):
-                            if attr.lower() == name:
-                                func = getattr(ta, attr)
-                                break
-                                
-                    if not func:
-                        return df_in
-                        
-                    args = []
-                    kwargs = {}
-                    if args_str:
-                        parts = re.split(r'[,\s]+', args_str.strip())
-                        for p in parts:
-                            if not p:
-                                continue
-                            try:
-                                if '.' in p:
-                                    args.append(float(p))
-                                else:
-                                    args.append(int(p))
-                            except ValueError:
-                                if '=' in p:
-                                    k, v = p.split('=', 1)
-                                    try:
-                                        kwargs[k.strip()] = float(v.strip()) if '.' in v else int(v.strip())
-                                    except ValueError:
-                                        kwargs[k.strip()] = v.strip()
-                                else:
-                                    args.append(p)
-                                    
-                    try:
-                        sig = inspect.signature(func)
-                        params = list(sig.parameters.keys())
-                        call_kwargs = {}
-                        
-                        for p in params:
-                            p_lower = p.lower()
-                            if p_lower == "close":
-                                call_kwargs[p] = df_in["close"]
-                            elif p_lower == "high":
-                                call_kwargs[p] = df_in["high"]
-                            elif p_lower == "low":
-                                call_kwargs[p] = df_in["low"]
-                            elif p_lower == "volume":
-                                call_kwargs[p] = df_in["volume"]
-                            elif p_lower == "open":
-                                call_kwargs[p] = df_in["open"]
-                                
-                        if not call_kwargs and len(params) > 0:
-                            first_param = params[0]
-                            call_kwargs[first_param] = df_in["close"]
-                            
-                        remaining_params = [p for p in params if p not in call_kwargs]
-                        for idx, val in enumerate(args):
-                            if idx < len(remaining_params):
-                                call_kwargs[remaining_params[idx]] = val
-                                
-                        call_kwargs.update(kwargs)
-                        res = func(**call_kwargs)
-                        
-                        if res is not None:
-                            if isinstance(res, pd.Series):
-                                col_name = res.name if res.name else f"{name}_{args[0]}" if args else name
-                                col_name = str(col_name).lower()
-                                df_in[col_name] = res
-                                if name == "rsi":
-                                    df_in["rsi"] = res
-                                elif name == "atr":
-                                    df_in["atr"] = res
-                            elif isinstance(res, pd.DataFrame):
-                                for col in res.columns:
-                                    col_name = str(col).lower()
-                                    df_in[col_name] = res[col]
-                                    if "macd" in name:
-                                        if "macd_" in col_name or col_name.startswith("macd_"):
-                                            df_in["macd_line"] = res[col]
-                                        elif "macds_" in col_name or "signal" in col_name:
-                                            df_in["macd_signal"] = res[col]
-                                        elif "macdh_" in col_name or "hist" in col_name:
-                                            df_in["macd_hist"] = res[col]
-                                    elif "stoch" in name:
-                                        if "stochk_" in col_name or col_name.endswith("_k") or col_name.startswith("stochk"):
-                                            df_in["stoch_k"] = res[col]
-                                        elif "stochd_" in col_name or col_name.endswith("_d") or col_name.startswith("stochd"):
-                                            df_in["stoch_d"] = res[col]
-                                    elif "bbands" in name or "bb" in name:
-                                        if "bbl_" in col_name or "lower" in col_name:
-                                            df_in["bb_low"] = res[col]
-                                        elif "bbm_" in col_name or "middle" in col_name:
-                                            df_in["bb_mid"] = res[col]
-                                        elif "bbu_" in col_name or "upper" in col_name:
-                                            df_in["bb_upper"] = res[col]
-                    except Exception as e:
-                        log.warning(f"Failed to calculate dynamic indicator '{ind_str}': {e}")
-                    return df_in
-
-                # Extract potential indicator strings from rules text and spec indicators
-                rules_text = f"{spec.get('entry', '')} {spec.get('exit', '')} {spec.get('stop_loss', '')} {spec.get('target', '')} {source_prompt}"
-                rules_lower = rules_text.lower()
-
-                indicators_to_compute = list(spec.get("indicators", []))
-                import re
-                pattern = r'\b(ema|sma|rsi|atr|macd|stoch|bb|bollinger|cci|adx|supertrend|willr|trix|obv|vwap|mom)\b(?:\s*\(?\s*[\d\s,\.-]+\s*\)?)?'
-                found_indicator_matches = [m.group(0) for m in re.finditer(pattern, rules_lower)]
-                for match in found_indicator_matches:
-                    if match not in indicators_to_compute:
-                        indicators_to_compute.append(match)
-
-                for ind in indicators_to_compute:
-                    df = calculate_custom_indicator(df, ind)
-
-                df = df.ffill().fillna(0)
-
-                rules = {
-                    "crossover": False,
-                    "fast_ma": "ema_50",
-                    "slow_ma": "ema_200",
-                    "rsi_buy": False,
-                    "rsi_buy_level": 30.0,
-                    "bb_buy": False,
-                    "sl_atr_mult": 1.5,
-                    "tp_r_mult": 3.5,
-                    "is_short": False
-                }
-                
-                # Check for moving average crossover triggers
-                if "golden cross" in rules_lower or "cross" in rules_lower or "crossover" in rules_lower or "above" in rules_lower or "below" in rules_lower:
-                    rules["crossover"] = True
-                    if "sma" in rules_lower:
-                        rules["fast_ma"] = "sma_50"
-                        rules["slow_ma"] = "sma_200"
-                    else:
-                        rules["fast_ma"] = "ema_50"
-                        rules["slow_ma"] = "ema_200"
-                        
-                    # Update crossover lengths dynamically based on rules text (e.g. "ema 9 crossing ema 21")
-                    ma_lengths = sorted([int(x) for x in re.findall(r"(?:ema|sma)\s*\(?\s*(\d+)\s*\)?", rules_lower)])
-                    if len(ma_lengths) >= 2:
-                        fast_len = ma_lengths[0]
-                        slow_len = ma_lengths[1]
-                        ma_type = "sma" if "sma" in rules_lower else "ema"
-                        rules["fast_ma"] = f"{ma_type}_{fast_len}"
-                        rules["slow_ma"] = f"{ma_type}_{slow_len}"
-                        
-                        # Dynamically compute MAs if not already computed
-                        for length in [fast_len, slow_len]:
-                            col_name = f"{ma_type}_{length}"
-                            if col_name not in df.columns:
-                                if ma_type == "sma":
-                                    df[col_name] = ta.sma(df["close"], length=length)
-                                else:
-                                    df[col_name] = ta.ema(df["close"], length=length)
-
-                    # Dynamic crossover: search for any custom computed columns that are mentioned in the rules text
-                    col_candidates = sorted([c for c in df.columns if c not in ["timestamp", "open", "high", "low", "volume"]], key=len, reverse=True)
-                    col_candidates.append("close")
-                    
-                    found_cols = []
-                    for c in col_candidates:
-                        pattern = make_indicator_regex(c)
-                        if re.search(pattern, rules_lower):
-                            found_cols.append(c)
-                            
-                    if len(found_cols) >= 2:
-                        # Sort candidates by their appearance index in rules_lower
-                        indices = []
-                        for c in found_cols:
-                            pat = make_indicator_regex(c)
-                            m = re.search(pat, rules_lower)
-                            if m:
-                                indices.append((c, m.start()))
-                        indices.sort(key=lambda x: x[1])
-                        rules["fast_ma"] = indices[0][0]
-                        rules["slow_ma"] = indices[1][0]
-                        
-                # Check for RSI boundary triggers
-                elif "rsi" in rules_lower:
-                    rules["rsi_buy"] = True
-                    matches = re.findall(r"rsi\s*(?:<|<=|below|dips below)\s*(\d+)", rules_lower)
-                    if matches:
-                        rules["rsi_buy_level"] = float(matches[0])
-                        
-                # Check for Bollinger Band boundaries
-                elif "lower band" in rules_lower or "bb low" in rules_lower or "bollinger low" in rules_lower or "bbl" in rules_lower:
-                    rules["bb_buy"] = True
-
-                # Dynamic check for MACD and Stochastic crossover indicators
-                rules["macd_crossover"] = "macd" in rules_lower and ("cross" in rules_lower or "signal" in rules_lower)
-                rules["stoch_crossover"] = "stoch" in rules_lower and "cross" in rules_lower
-
-                # ATR stop loss multiplier parsing
-                sl_match = re.findall(r"(\d+(?:\.\d+)?)\s*(?:\*|x)?\s*atr", rules_lower)
-                if sl_match:
-                    rules["sl_atr_mult"] = float(sl_match[0])
-                    
-                # Take profit risk multiplier parsing
-                tp_match = re.findall(r"(\d+(?:\.\d+)?)\s*(?:\*|x)?\s*r", rules_lower)
-                if tp_match:
-                    rules["tp_r_mult"] = float(tp_match[0])
-
-                if "short" in rules_lower or "sell" in rules_lower:
-                    rules["is_short"] = True
-
-                # Simulate position updates bar by bar
-                in_position = False
-                entry_price = 0.0
-                entry_dt = None
-                position_side = "LONG"
-                stop_price = 0.0
-                target_price = 0.0
-
-                for i in range(1, len(df)):
-                    row = df.iloc[i]
-                    prev_row = df.iloc[i-1]
-                    dt = row["timestamp"]
-
-                    if not in_position:
-                        buy_triggered = False
-                        
-                        if rules["crossover"]:
-                            fast_val = row[rules["fast_ma"]]
-                            slow_val = row[rules["slow_ma"]]
-                            prev_fast = prev_row[rules["fast_ma"]]
-                            prev_slow = prev_row[rules["slow_ma"]]
-                            
-                            if rules["is_short"]:
-                                buy_triggered = (fast_val < slow_val) and (prev_fast >= prev_slow)
-                            else:
-                                buy_triggered = (fast_val > slow_val) and (prev_fast <= prev_slow)
-                                
-                        elif rules.get("macd_crossover") and "macd_line" in df.columns and "macd_signal" in df.columns:
-                            macd_val = row["macd_line"]
-                            sig_val = row["macd_signal"]
-                            prev_macd = prev_row["macd_line"]
-                            prev_sig = prev_row["macd_signal"]
-                            if rules["is_short"]:
-                                buy_triggered = (macd_val < sig_val) and (prev_macd >= prev_sig)
-                            else:
-                                buy_triggered = (macd_val > sig_val) and (prev_macd <= prev_sig)
-                                
-                        elif rules.get("stoch_crossover") and "stoch_k" in df.columns and "stoch_d" in df.columns:
-                            k_val = row["stoch_k"]
-                            d_val = row["stoch_d"]
-                            prev_k = prev_row["stoch_k"]
-                            prev_d = prev_row["stoch_d"]
-                            if rules["is_short"]:
-                                buy_triggered = (k_val < d_val) and (prev_k >= prev_d)
-                            else:
-                                buy_triggered = (k_val > d_val) and (prev_k <= prev_d)
-                                
-                        elif rules["rsi_buy"]:
-                            rsi_val = row["rsi"]
-                            prev_rsi = prev_row["rsi"]
-                            if rules["is_short"]:
-                                buy_triggered = (rsi_val > 70) and (prev_rsi <= 70)
-                            else:
-                                buy_triggered = (rsi_val < rules["rsi_buy_level"]) and (prev_rsi >= rules["rsi_buy_level"])
-                                
-                        elif rules["bb_buy"]:
-                            close_val = row["close"]
-                            if rules["is_short"]:
-                                buy_triggered = close_val >= row["bb_upper"]
-                            else:
-                                buy_triggered = close_val <= row["bb_low"]
-                        else:
-                            # Fallback SMA crossover
-                            buy_triggered = (row["sma_50"] > row["sma_200"]) and (prev_row["sma_50"] <= prev_row["sma_200"])
-
-                        if buy_triggered:
-                            in_position = True
-                            entry_price = float(row["close"])
-                            entry_dt = dt
-                            position_side = "SHORT" if rules["is_short"] else "LONG"
-                            
-                            atr_val = float(row["atr"]) if float(row["atr"]) > 0 else (entry_price * 0.02)
-                            sl_dist = rules["sl_atr_mult"] * atr_val
-                            
-                            if position_side == "LONG":
-                                stop_price = entry_price - sl_dist
-                                target_price = entry_price + (rules["tp_r_mult"] * sl_dist)
-                            else:
-                                stop_price = entry_price + sl_dist
-                                target_price = entry_price - (rules["tp_r_mult"] * sl_dist)
-                    else:
-                        high_val = float(row["high"])
-                        low_val = float(row["low"])
-                        close_val = float(row["close"])
-                        
-                        exit_triggered = False
-                        exit_price = close_val
-                        is_win = False
-                        pnl_pct = 0.0
-                        
-                        if position_side == "LONG":
-                            if low_val <= stop_price:
-                                exit_triggered = True
-                                exit_price = stop_price
-                                is_win = False
-                                pnl_pct = -rules["sl_atr_mult"] * (row["atr"] / entry_price * 100) if row["atr"] > 0 else -2.0
-                                pnl_pct = max(-10.0, min(-0.5, pnl_pct))
-                            elif high_val >= target_price:
-                                exit_triggered = True
-                                exit_price = target_price
-                                is_win = True
-                                sl_pct = rules["sl_atr_mult"] * (row["atr"] / entry_price * 100) if row["atr"] > 0 else 2.0
-                                pnl_pct = rules["tp_r_mult"] * sl_pct
-                                pnl_pct = min(45.0, max(1.5, pnl_pct))
-                        else:
-                            if high_val >= stop_price:
-                                exit_triggered = True
-                                exit_price = stop_price
-                                is_win = False
-                                pnl_pct = -rules["sl_atr_mult"] * (row["atr"] / entry_price * 100) if row["atr"] > 0 else -2.0
-                                pnl_pct = max(-10.0, min(-0.5, pnl_pct))
-                            elif low_val <= target_price:
-                                exit_triggered = True
-                                exit_price = target_price
-                                is_win = True
-                                sl_pct = rules["sl_atr_mult"] * (row["atr"] / entry_price * 100) if row["atr"] > 0 else 2.0
-                                pnl_pct = rules["tp_r_mult"] * sl_pct
-                                pnl_pct = min(45.0, max(1.5, pnl_pct))
-
-                        if exit_triggered:
-                            equity_val = equity_val * (1.0 + pnl_pct / 100.0)
-                            if equity_val < 5.0:
-                                equity_val = 5.0
-                                
-                            timestamp_ms = int(dt.timestamp() * 1000)
-                            equity_curve.append([timestamp_ms, round(equity_val, 2)])
-                            
-                            r_mult = f"+{round(rules['tp_r_mult'], 1)}R" if is_win else f"−{round(rules['sl_atr_mult'], 1)}R"
-                            
-                            trades.append({
-                                "date": dt.strftime("%Y-%m-%d"),
-                                "side": position_side,
-                                "entry": round(entry_price, 2),
-                                "exit": round(exit_price, 2),
-                                "r": r_mult,
-                                "pos": is_win,
-                                "pnl_pct": round(pnl_pct, 2)
-                            })
-                            in_position = False
-
-                if len(trades) >= 1:
-                    real_backtest_success = True
-                    
-                    # Compute yearly stats directly from actual trades
-                    for yr in range(2018, 2027):
-                        yr_trades = [t for t in trades if t["date"].startswith(str(yr))]
-                        yr_count = len(yr_trades)
-                        if yr_count > 0:
-                            yr_wins = sum(1 for t in yr_trades if t["pos"])
-                            yr_win_rate = round((yr_wins / yr_count) * 100, 1)
-                            yr_pnl = round(sum(t["pnl_pct"] for t in yr_trades), 1)
-                            yr_dd = max(3.0, round(random.uniform(8.0, 15.0) - yr_pnl * 0.1, 1))
-                        else:
-                            yr_win_rate = 0.0
-                            yr_pnl = 0.0
-                            yr_dd = 0.0
-                        yearly_breakdown.append({
-                            "year": yr,
-                            "trades_count": yr_count,
-                            "return_pct": yr_pnl,
-                            "drawdown_pct": yr_dd,
-                            "win_rate_pct": yr_win_rate
-                        })
-
-                    total_trades = len(trades)
-                    overall_wins = sum(1 for t in trades if t["pos"])
-                    overall_win_rate = round((overall_wins / total_trades) * 100, 1)
-                    total_return_pct = round(equity_val - 100.0, 1)
-                    
-                    gross_profit = sum(t["pnl_pct"] for t in trades if t["pnl_pct"] > 0)
-                    gross_loss = abs(sum(t["pnl_pct"] for t in trades if t["pnl_pct"] < 0))
-                    profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else 9.99
-                    
-                    max_dd = max(y["drawdown_pct"] for y in yearly_breakdown) if yearly_breakdown else 12.0
-                    max_dd = round(max_dd * random.uniform(1.05, 1.25), 1)
-                    
-                    sharpe = round(1.0 + (profit_factor - 1.0) * 0.75 + random.uniform(-0.15, 0.15), 2)
-                    sharpe = max(0.2, sharpe)
-
-                    trades.reverse()
-                    yearly_breakdown.reverse()
-
-                    stats = {
-                        "win_rate_pct": overall_win_rate,
-                        "sharpe_ratio": sharpe,
-                        "max_drawdown_pct": max_dd,
-                        "profit_factor": profit_factor,
-                        "trade_count": total_trades,
-                        "total_return_pct": total_return_pct,
-                        "equity_curve": equity_curve,
-                        "trades": trades,
-                        "yearly_breakdown": yearly_breakdown
-                    }
-        except Exception as real_err:
-            log.warning(f"Real historical backtest execution failed: {real_err}. Falling back to simulation.")
-
-        # Fallback to high-fidelity simulation if real backtest was unsuccessful or generated no trades
-        if not real_backtest_success:
-            log.info("Running simulated quantitative backtest engine (fallback mode)")
-            is_risky = "breakout" in str(spec).lower() or "squeeze" in str(spec).lower()
-            asset_base = asset_str.split("/")[0] if "/" in asset_str else asset_str
-            
-            # Baseline prices per year to match historical ranges
-            asset_yearly_prices = {
-                "BTC": {
-                    2018: 6500.0, 2019: 8000.0, 2020: 18000.0, 2021: 45000.0,
-                    2022: 28000.0, 2023: 26000.0, 2024: 65000.0, 2025: 95000.0, 2026: 98000.0
-                },
-                "ETH": {
-                    2018: 400.0, 2019: 250.0, 2020: 500.0, 2021: 2500.0,
-                    2022: 1800.0, 2023: 1900.0, 2024: 3100.0, 2025: 3500.0, 2026: 3400.0
-                },
-                "SOL": {
-                    2018: 1.5, 2019: 2.0, 2020: 3.0, 2021: 120.0,
-                    2022: 40.0, 2023: 35.0, 2024: 150.0, 2025: 180.0, 2026: 175.0
-                }
-            }
-
-            # Market profiles by year
-            year_market_profiles = {
-                2018: {"win_rate": 39.0, "pnl_win_range": (1.2, 2.8), "pnl_loss_range": (-1.5, -0.8)},
-                2019: {"win_rate": 48.0, "pnl_win_range": (1.5, 3.2), "pnl_loss_range": (-1.4, -0.9)},
-                2020: {"win_rate": 56.0, "pnl_win_range": (1.8, 4.2), "pnl_loss_range": (-1.2, -0.8)},
-                2021: {"win_rate": 59.0, "pnl_win_range": (2.0, 4.5), "pnl_loss_range": (-1.2, -0.8)},
-                2022: {"win_rate": 41.0, "pnl_win_range": (1.2, 2.5), "pnl_loss_range": (-1.6, -1.0)},
-                2023: {"win_rate": 51.0, "pnl_win_range": (1.5, 3.5), "pnl_loss_range": (-1.3, -0.9)},
-                2024: {"win_rate": 55.0, "pnl_win_range": (1.8, 4.0), "pnl_loss_range": (-1.2, -0.8)},
-                2025: {"win_rate": 58.0, "pnl_win_range": (2.0, 4.5), "pnl_loss_range": (-1.1, -0.7)},
-                2026: {"win_rate": 53.0, "pnl_win_range": (1.6, 3.6), "pnl_loss_range": (-1.3, -0.8)}
-            }
-
-            year_price_map = {}
-            fallback_map = asset_yearly_prices.get(asset_base, {
-                y: 100.0 * (1.2 ** (y - 2018)) for y in range(2018, 2027)
-            })
-            year_price_map.update(fallback_map)
-            
-            if 'df' in locals() and not df.empty:
-                try:
-                    df_copy = df.copy()
-                    df_copy["year"] = df_copy["timestamp"].dt.year
-                    for yr, group in df_copy.groupby("year"):
-                        year_price_map[int(yr)] = float(group["close"].mean())
-                except Exception as e:
-                    log.warning(f"Could not compute real yearly prices for simulation: {e}")
-
-            trades = []
-            yearly_breakdown = []
-            equity_curve = []
-            equity_val = 100.0
-
-            for year in range(2018, 2027):
-                profile = year_market_profiles.get(year, {"win_rate": 50.0, "pnl_win_range": (1.5, 3.5), "pnl_loss_range": (-1.3, -0.9)})
-                win_rate_base = profile["win_rate"] + (random.uniform(-4, 4) if not is_risky else random.uniform(-6, 2))
-                
-                n_trades = random.randint(6, 10)
-                days = sorted([random.randint(10, 350) for _ in range(n_trades)])
-                
-                year_trades = []
-                wins = 0
-                base_price = year_price_map.get(year, 100.0)
-
-                for d in days:
-                    trade_dt = datetime(year, 1, 1) + timedelta(days=d)
-                    is_win = random.random() < (win_rate_base / 100.0)
-                    if is_win:
-                        wins += 1
-
-                    side = "LONG" if random.random() < 0.65 else "SHORT"
-                    entry_price = round(base_price * random.uniform(0.95, 1.05), 2)
-
-                    if is_win:
-                        pnl_mult = random.uniform(1.8, 3.8)
-                        pnl_pct = pnl_mult * random.uniform(profile["pnl_win_range"][0], profile["pnl_win_range"][1])
-                        r_mult = f"+{round(pnl_mult, 1)}R"
-                    else:
-                        pnl_mult = -1.0
-                        pnl_pct = random.uniform(profile["pnl_loss_range"][0], profile["pnl_loss_range"][1])
-                        r_mult = f"−{round(abs(pnl_mult), 1)}R"
-
-                    if side == "LONG":
-                        exit_price = round(entry_price * (1.0 + pnl_pct / 100.0), 2)
-                    else:
-                        exit_price = round(entry_price * (1.0 - pnl_pct / 100.0), 2)
-
-                    equity_val = equity_val * (1.0 + pnl_pct / 100.0)
-                    if equity_val < 5.0:
-                        equity_val = 5.0
-
-                    timestamp_ms = int(trade_dt.timestamp() * 1000)
-                    equity_curve.append([timestamp_ms, round(equity_val, 2)])
-
-                    trade_obj = {
-                        "date": trade_dt.strftime("%Y-%m-%d"),
-                        "side": side,
-                        "entry": entry_price,
-                        "exit": exit_price,
-                        "r": r_mult,
-                        "pos": is_win,
-                        "pnl_pct": round(pnl_pct, 2)
-                    }
-                    year_trades.append(trade_obj)
-                    trades.append(trade_obj)
-
-                y_trades_count = len(year_trades)
-                y_win_rate = round((wins / y_trades_count) * 100, 1) if y_trades_count > 0 else 0.0
-                y_return = round(sum(t["pnl_pct"] for t in year_trades), 1)
-                y_drawdown = max(3.0, round(random.uniform(10.0, 22.0) - y_return * 0.15, 1))
-
-                yearly_breakdown.append({
-                    "year": year,
-                    "trades_count": y_trades_count,
-                    "return_pct": y_return,
-                    "drawdown_pct": y_drawdown,
-                    "win_rate_pct": y_win_rate
-                })
-
-            total_trades = len(trades)
-            overall_wins = sum(1 for t in trades if t["pos"])
-            overall_win_rate = round((overall_wins / total_trades) * 100, 1) if total_trades > 0 else 0.0
-            total_return_pct = round(equity_val - 100.0, 1)
-            
-            gross_profit = sum(t["pnl_pct"] for t in trades if t["pnl_pct"] > 0)
-            gross_loss = abs(sum(t["pnl_pct"] for t in trades if t["pnl_pct"] < 0))
-            profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else 9.99
-            
-            max_dd = max(y["drawdown_pct"] for y in yearly_breakdown) if yearly_breakdown else 12.0
-            max_dd = round(max_dd * random.uniform(1.05, 1.25), 1)
-            
-            sharpe = round(1.0 + (profit_factor - 1.0) * 0.75 + random.uniform(-0.15, 0.15), 2)
-            sharpe = max(0.2, sharpe)
-
-            trades.reverse()
-            yearly_breakdown.reverse()
-
-            stats = {
-                "win_rate_pct": overall_win_rate,
-                "sharpe_ratio": sharpe,
-                "max_drawdown_pct": max_dd,
-                "profit_factor": profit_factor,
-                "trade_count": total_trades,
-                "total_return_pct": total_return_pct,
-                "equity_curve": equity_curve,
-                "trades": trades,
-                "yearly_breakdown": yearly_breakdown
-            }
+        # ccxt + pandas work is blocking — keep the event loop free
+        stats = await asyncio.to_thread(_run_backtest_sync, spec, source_prompt, start_date, end_date)
 
         db.table("backtest_runs").update({
             "status": "completed",
             "stats": stats,
-            "completed_at": datetime.now().isoformat()
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", run_id).execute()
+
+    except BacktestError as be:
+        log.info(f"Backtest {run_id} failed honestly: {be}")
+        db.table("backtest_runs").update({"status": "failed", "error": str(be)}).eq("id", run_id).execute()
+    except Exception as exc:
+        log.exception(f"Backtest {run_id} crashed")
+        db.table("backtest_runs").update({
+            "status": "failed",
+            "error": "The backtest engine hit an unexpected error. Please try again or rephrase the strategy.",
         }).eq("id", run_id).execute()
 
 
-    except Exception as exc:
-        db.table("backtest_runs").update({"status": "failed", "error": str(exc)}).eq("id", run_id).execute()
-
+# ── Endpoints (unchanged contracts) ──────────────────────────────────────────
 
 @router.post("", status_code=status.HTTP_202_ACCEPTED, summary="Queue a backtest run")
 async def queue_backtest(
@@ -722,7 +1001,7 @@ async def queue_backtest(
         "auto": 999999
     }
     user_limit = limits.get(tier.lower(), 1)
-    
+
     if count >= user_limit:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -760,11 +1039,10 @@ async def queue_backtest(
         .execute()
     )
     run = result.data[0]
-    
-    # 6. Spawn simulated quant task in background
+
+    # 6. Run the engine in the background
     background_tasks.add_task(_run_backtest, run["id"], str(body.strategy_id), body.start_date, body.end_date, db)
     return run
-
 
 
 @router.get("/{run_id}", summary="Get backtest run status and results")
@@ -799,6 +1077,36 @@ async def list_backtests(
         .execute()
     )
     return result.data
+
+
+@router.get("/{run_id}/trades/{trade_index}/chart", summary="OHLC context for one backtested trade")
+async def get_trade_chart(
+    run_id: UUID,
+    trade_index: int,
+    user_id: CurrentUser,
+    db: Annotated[Client, Depends(get_db)],
+) -> dict:
+    """Real candles around a single trade so the UI can show where it bought and sold."""
+    run_res = (
+        db.table("backtest_runs")
+        .select("stats, strategy_id")
+        .eq("id", str(run_id))
+        .eq("user_id", user_id)
+        .single()
+        .execute()
+    )
+    if not run_res.data or not run_res.data.get("stats"):
+        raise HTTPException(status_code=404, detail="Backtest run not found")
+
+    spec = {}
+    strat_res = db.table("strategies").select("spec").eq("id", run_res.data["strategy_id"]).single().execute()
+    if strat_res.data:
+        spec = strat_res.data.get("spec") or {}
+
+    try:
+        return await asyncio.to_thread(_trade_chart_payload, run_res.data["stats"], spec, trade_index)
+    except BacktestError as be:
+        raise HTTPException(status_code=422, detail=str(be))
 
 
 @router.post("/{run_id}/analyze", summary="AI Strategy Quant Coach Audit")
