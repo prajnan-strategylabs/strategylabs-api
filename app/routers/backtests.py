@@ -42,7 +42,7 @@ RISK_PCT_PER_TRADE = 1.0        # risk-based sizing, same model as the v22 resea
 DEFAULT_SL_ATR_MULT = 1.5
 DEFAULT_TP_R_MULT = 3.0
 WARMUP_BARS = 250               # extra history so 200-period indicators are valid at start
-MAX_BARS = 6_000                # keeps multi-page fetches inside the frontend's poll budget
+MAX_BARS = 20_000               # 8y of 4H fits; beyond this we step down a timeframe
 MONTE_CARLO_RUNS = 500
 MONTE_CARLO_SEED = 42
 EARLIEST_START = datetime(2017, 1, 1, tzinfo=timezone.utc)
@@ -96,14 +96,45 @@ RETEST_TOUCH_TOL = 1.002      # a pullback low within 0.2% of the level counts a
 MAX_BREAKOUT_LOOKBACK = 200   # channel lookback capped at the indicator warm-up budget
 
 
+def _split_direction_sections(t: str) -> Optional[tuple[str, str]]:
+    """Detect 'LONG: ... SHORT: ...' style dual-direction rules (either order)."""
+    m_long = re.search(r"\blong\b[^:]{0,25}:", t)
+    m_short = re.search(r"\bshort\b[^:]{0,25}:", t)
+    if not (m_long and m_short) or m_long.start() == m_short.start():
+        return None
+    if m_long.start() < m_short.start():
+        return t[m_long.end():m_short.start()], t[m_short.end():]
+    return t[m_long.end():], t[m_short.end():m_long.start()]
+
+
 def _parse_entry(entry_text: str, timeframe: str = "1d") -> dict:
     """
-    Compile the entry rule text into a structured event trigger plus a list of
-    AND-filters (state conditions that must also hold on the signal bar).
-    Raises BacktestError when no testable trigger is found.
+    Compile the entry rule text into one or two (LONG/SHORT) structured event
+    triggers, each with its own AND-filters. Raises BacktestError when no
+    testable trigger is found.
     """
     t = entry_text.lower()
-    is_short = bool(re.search(r"\b(short|go short|sell short)\b", t))
+    sections = _split_direction_sections(t)
+    if sections:
+        long_side = _parse_side(sections[0], timeframe, force_short=False)
+        short_side = _parse_side(sections[1], timeframe, force_short=True)
+        return {
+            "type": "dual", "is_short": False,
+            "sides": [long_side, short_side],
+            "label": f"LONG: {_side_label(long_side)} | SHORT: {_side_label(short_side)}",
+        }
+    return _parse_side(t, timeframe, force_short=None)
+
+
+def _side_label(side: dict) -> str:
+    label = side["label"]
+    if side.get("filters"):
+        label += " (filters: " + ", ".join(f["label"] for f in side["filters"]) + ")"
+    return label
+
+
+def _parse_side(t: str, timeframe: str, force_short: Optional[bool]) -> dict:
+    is_short = force_short if force_short is not None else bool(re.search(r"\b(short|go short|sell short)\b", t))
     tf_minutes = TF_MINUTES.get(timeframe, DAY_MINUTES)
 
     trigger: Optional[dict] = None
@@ -131,6 +162,19 @@ def _parse_entry(entry_text: str, timeframe: str = "1d") -> dict:
                         f"{'below' if band == 'low' else 'above'} the level)" if retest else ""),
         }
         used.add("breakout")
+
+    # ── Price/close crossing a single MA ("close crosses above EMA 55") ──
+    # Must outrank the two-MA crossover: a second MA in the sentence is usually
+    # a regime filter ("...while price above EMA 200"), not the cross pair.
+    if trigger is None:
+        m = re.search(
+            r"(?:close|price|candle)s?\s*cross(?:es|ing|ed)?\s*(above|over|below|under)\s*(?:the\s*)?(ema|sma)\s*\(?\s*(\d+)\s*\)?", t)
+        if m:
+            side_word = "above" if m.group(1) in ("above", "over") else "below"
+            ma = f"{m.group(2)}_{int(m.group(3))}"
+            trigger = {"type": "price_vs_ma", "ma": ma, "side": side_word, "is_short": is_short,
+                       "label": f"close crossing {side_word} {ma.upper()}"}
+            used.add("ma_trigger:" + ma)
 
     has_cross = bool(re.search(r"\bcross(es|ing|over|ed)?\b|golden cross|death cross", t))
     ma_refs = _find_ma_refs(t)
@@ -268,8 +312,8 @@ def _parse_exit(exit_text: str, entry: dict) -> dict:
     elif ma_refs and re.search(r"\b(above|over|cross(es|ing)? above)\b", t):
         out["close_above_ma"] = f"{ma_refs[0][0]}_{ma_refs[0][1]}"
 
-    if entry.get("type") == "ma_cross" and re.search(r"\b(opposite|reverse|cross(es|ing)? back)\b", t):
-        out["opposite_cross"] = True
+    if re.search(r"\b(opposite|reverse|cross(es|ing)? back)\b", t):
+        out["opposite_cross"] = True  # applied at runtime for MA-cross / price-vs-MA triggers
 
     m = re.search(r"(?:after|within|max(?:imum)?)\s*(\d+)\s*(bar|bars|candle|candles|day|days)", t)
     if m:
@@ -389,13 +433,15 @@ def _ensure_rule_columns(df: pd.DataFrame, entry: dict, exits: dict) -> pd.DataF
     import pandas_ta as ta
 
     needed: list[str] = []
-    if entry["type"] == "ma_cross":
-        needed += [entry["fast"], entry["slow"]]
-    if entry["type"] == "price_vs_ma":
-        needed.append(entry["ma"])
-    for f in entry.get("filters", []):
-        if "ma" in f:
-            needed.append(f["ma"])
+    sides = entry["sides"] if entry["type"] == "dual" else [entry]
+    for side in sides:
+        if side["type"] == "ma_cross":
+            needed += [side["fast"], side["slow"]]
+        if side["type"] == "price_vs_ma":
+            needed.append(side["ma"])
+        for f in side.get("filters", []):
+            if "ma" in f:
+                needed.append(f["ma"])
     for key in ("close_below_ma", "close_above_ma"):
         if key in exits:
             needed.append(exits[key])
@@ -406,11 +452,12 @@ def _ensure_rule_columns(df: pd.DataFrame, entry: dict, exits: dict) -> pd.DataF
             fn = ta.sma if ma_type == "sma" else ta.ema
             df[col] = fn(df["close"], length=int(ln))
 
-    if entry["type"] == "breakout":
-        n = entry["lookback"]
-        # channel of the PRIOR n bars — shift(1) keeps the current bar out of its own level
-        df[f"hh_{n}"] = df["high"].rolling(n).max().shift(1)
-        df[f"ll_{n}"] = df["low"].rolling(n).min().shift(1)
+    for side in sides:
+        if side["type"] == "breakout":
+            n = side["lookback"]
+            # channel of the PRIOR n bars — shift(1) keeps the current bar out of its own level
+            df[f"hh_{n}"] = df["high"].rolling(n).max().shift(1)
+            df[f"ll_{n}"] = df["low"].rolling(n).min().shift(1)
 
     return df
 
@@ -519,10 +566,15 @@ def _rule_exit_signal(exits: dict, entry: dict, row: pd.Series, prev: pd.Series)
         ma = exits["close_above_ma"]
         if not _isnan(row.get(ma)) and float(row["close"]) > float(row[ma]):
             return f"close>{ma}"
-    if exits.get("opposite_cross") and entry.get("type") == "ma_cross":
-        flipped = dict(entry, is_short=not entry["is_short"])
-        if _entry_signal(flipped, row, prev):
-            return "opposite_cross"
+    if exits.get("opposite_cross"):
+        if entry.get("type") == "ma_cross":
+            flipped = dict(entry, is_short=not entry["is_short"])
+            if _entry_signal(flipped, row, prev):
+                return "opposite_cross"
+        elif entry.get("type") == "price_vs_ma":
+            flipped = dict(entry, side=("below" if entry["side"] == "above" else "above"))
+            if _entry_signal(flipped, row, prev):
+                return "opposite_cross"
     return None
 
 
@@ -548,7 +600,8 @@ def _simulate(df: pd.DataFrame, entry: dict, exits: dict, stop: dict, target: di
     trades: list[dict] = []
     equity_curve: list[list[float]] = [[int(start_ts.timestamp() * 1000), START_EQUITY]]
 
-    filters = entry.get("filters", [])
+    sides = entry["sides"] if entry.get("type") == "dual" else [entry]
+    active = sides[0]                # rule side that opened the current position
     pending: Optional[dict] = None   # armed breakout awaiting its retest
 
     in_pos = False
@@ -589,7 +642,7 @@ def _simulate(df: pd.DataFrame, entry: dict, exits: dict, stop: dict, target: di
                     exit_price, exit_reason = target_price, "take_profit"
 
             if exit_price is None:
-                reason = _rule_exit_signal(exits, entry, row, prev)
+                reason = _rule_exit_signal(exits, active, row, prev)
                 if reason:
                     exit_price, exit_reason = c, reason
                 elif exits.get("max_bars_held") and bars_held >= exits["max_bars_held"]:
@@ -647,44 +700,54 @@ def _simulate(df: pd.DataFrame, entry: dict, exits: dict, stop: dict, target: di
         if i >= n - 1:
             break
 
-        signal = False
+        signal_side: Optional[dict] = None
         retest_extreme: Optional[float] = None
-        if entry["type"] == "breakout" and entry.get("retest"):
-            # Two-stage: a breakout arms a pending setup; price pulling back to
-            # touch the broken level and closing back on the breakout side confirms.
-            if pending is None:
-                if _entry_signal(entry, row, prev) and _filters_pass(filters, row):
-                    col = f"hh_{entry['lookback']}" if entry["band"] == "high" else f"ll_{entry['lookback']}"
-                    lvl = float(row[col])
-                    atr_now = float(row["atr"]) if not _isnan(row.get("atr")) and float(row["atr"]) > 0 else lvl * 0.02
-                    pending = {"level": lvl, "deadline": i + RETEST_WAIT_BARS, "atr": atr_now}
-            else:
-                lvl = pending["level"]
-                c_now = float(row["close"])
-                if entry["band"] == "high":
-                    touched = float(row["low"]) <= lvl * RETEST_TOUCH_TOL and c_now >= lvl
-                    invalidated = c_now < lvl - pending["atr"]
-                    extreme = float(row["low"])
-                else:
-                    touched = float(row["high"]) >= lvl / RETEST_TOUCH_TOL and c_now <= lvl
-                    invalidated = c_now > lvl + pending["atr"]
-                    extreme = float(row["high"])
-                if touched:
-                    signal = True
-                    retest_extreme = extreme
-                    pending = None
-                elif invalidated or i >= pending["deadline"]:
-                    pending = None
-        else:
-            signal = _entry_signal(entry, row, prev) and _filters_pass(filters, row)
 
-        if signal:
+        # Stage 2 of an armed breakout: price pulling back to touch the broken
+        # level and closing back on the breakout side confirms the entry.
+        if pending is not None:
+            s = pending["side"]
+            lvl = pending["level"]
+            c_now = float(row["close"])
+            if s["band"] == "high":
+                touched = float(row["low"]) <= lvl * RETEST_TOUCH_TOL and c_now >= lvl
+                invalidated = c_now < lvl - pending["atr"]
+                extreme = float(row["low"])
+            else:
+                touched = float(row["high"]) >= lvl / RETEST_TOUCH_TOL and c_now <= lvl
+                invalidated = c_now > lvl + pending["atr"]
+                extreme = float(row["high"])
+            if touched:
+                signal_side = s
+                retest_extreme = extreme
+                pending = None
+            elif invalidated or i >= pending["deadline"]:
+                pending = None
+
+        # Fresh signals — first side (LONG before SHORT for dual rules) wins the bar
+        if signal_side is None:
+            for s in sides:
+                if not (_entry_signal(s, row, prev) and _filters_pass(s.get("filters", []), row)):
+                    continue
+                if s["type"] == "breakout" and s.get("retest"):
+                    if pending is None:
+                        col = f"hh_{s['lookback']}" if s["band"] == "high" else f"ll_{s['lookback']}"
+                        lvl = float(row[col])
+                        atr_now = float(row["atr"]) if not _isnan(row.get("atr")) and float(row["atr"]) > 0 else lvl * 0.02
+                        pending = {"side": s, "level": lvl, "deadline": i + RETEST_WAIT_BARS, "atr": atr_now}
+                    continue  # armed, not an entry yet
+                signal_side = s
+                break
+
+        if signal_side is not None:
+            s = signal_side
+            pending = None
             nxt = df.iloc[i + 1]
             fill = float(nxt["open"])
             atr_val = float(row["atr"]) if not _isnan(row.get("atr")) and float(row["atr"]) > 0 else fill * 0.02
 
             if stop["mode"] == "retest_low" and retest_extreme is not None:
-                sl_dist = (fill - retest_extreme) if not entry["is_short"] else (retest_extreme - fill)
+                sl_dist = (fill - retest_extreme) if not s["is_short"] else (retest_extreme - fill)
                 if sl_dist <= 0:  # retest bar's extreme is on the wrong side of the fill — fall back
                     sl_dist = stop["mult"] * atr_val
             elif stop["mode"] == "atr" or stop["mode"] == "retest_low":
@@ -698,7 +761,8 @@ def _simulate(df: pd.DataFrame, entry: dict, exits: dict, stop: dict, target: di
             else:
                 tp_dist = fill * target["pct"] / 100.0
 
-            side = "SHORT" if entry["is_short"] else "LONG"
+            active = s
+            side = "SHORT" if s["is_short"] else "LONG"
             entry_price = fill
             entry_ts_ms = int(nxt["timestamp"].timestamp() * 1000)
             entry_date_str = nxt["timestamp"].strftime("%Y-%m-%d")
@@ -829,10 +893,14 @@ def _run_backtest_sync(spec: dict, source_prompt: str, start_date: str, end_date
     if start_dt >= end_dt:
         raise BacktestError("Start date must be before end date.")
 
-    # 2. Timeframe — drop to daily when the window would exceed the bar budget
+    # 2. Timeframe — step down (1h → 4h → 1d) only if the window exceeds the bar budget
     timeframe = _normalize_timeframe(spec)
     range_minutes = (end_dt - start_dt).total_seconds() / 60
-    if range_minutes / TF_MINUTES[timeframe] > MAX_BARS:
+    for tf in (timeframe, "4h", "1d"):
+        if TF_MINUTES[tf] >= TF_MINUTES[timeframe] and range_minutes / TF_MINUTES[tf] <= MAX_BARS:
+            timeframe = tf
+            break
+    else:
         timeframe = "1d"
     tf_minutes = TF_MINUTES[timeframe]
 
@@ -877,7 +945,7 @@ def _run_backtest_sync(spec: dict, source_prompt: str, start_date: str, end_date
         "asset": asset,
         "timeframe": timeframe,
         "entry": entry_label,
-        "direction": "SHORT" if entry["is_short"] else "LONG",
+        "direction": "LONG + SHORT" if entry.get("type") == "dual" else ("SHORT" if entry["is_short"] else "LONG"),
         "stop_loss": stop["label"],
         "target": target["label"],
         "rule_exits": {k: v for k, v in exits.items()} or None,
