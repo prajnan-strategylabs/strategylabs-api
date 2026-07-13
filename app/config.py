@@ -49,6 +49,15 @@ class Settings(BaseSettings):
     telegram_signal_min_tier: str = "trader"
     revenuecat_webhook_auth: str = ""
 
+    # ── Firebase Cloud Messaging (native app push notifications) ─────────────
+    # Raw JSON contents of a Firebase service-account key (Project Settings →
+    # Service Accounts → Generate new private key). NOT the same file as the
+    # Android app's google-services.json. When empty, the push sender is a
+    # no-op — useful for local dev and before the credential is provisioned.
+    firebase_service_account_json: str = ""
+    # Lowest tier that receives push alerts. Mirrors telegram_signal_min_tier.
+    push_signal_min_tier: str = "trader"
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 

@@ -35,6 +35,7 @@ from .db import (
 from .exchange import fetch_ohlcv
 from .indicators import add_indicators
 from .notify import notify_closed_signal, notify_new_signal
+from .push import notify_closed_signal_push, notify_new_signal_push
 from .regime import get_btc_regime, get_daily_trend
 from .s3 import check_s3_signal
 from .s5 import check_s5_signal_at
@@ -123,13 +124,19 @@ async def run_full_scan() -> int:
             inserted = await asyncio.to_thread(insert_open_signal, sig)
             if inserted:
                 fired += 1
-                # Fire-and-forget Telegram notification so HTTP latency doesn't
-                # block the scan. The notifier handles eligibility + tier gate
-                # internally and silently no-ops if TELEGRAM_BOT_TOKEN is unset.
+                # Fire-and-forget Telegram + native push notifications so HTTP
+                # latency doesn't block the scan. Both notifiers handle
+                # eligibility + tier gate internally and silently no-op if
+                # their respective credential (TELEGRAM_BOT_TOKEN /
+                # FIREBASE_SERVICE_ACCOUNT_JSON) is unset.
                 try:
                     asyncio.create_task(notify_new_signal({**sig, **inserted}))
                 except Exception as e:
                     log.warning(f"[v22] could not schedule notify task: {e}")
+                try:
+                    asyncio.create_task(notify_new_signal_push({**sig, **inserted}))
+                except Exception as e:
+                    log.warning(f"[v22] could not schedule push task: {e}")
         # Small inter-symbol pause so we don't hammer Binance even with rate limiting
         await asyncio.sleep(0.05)
 
@@ -268,6 +275,10 @@ async def run_exit_checks() -> int:
                     asyncio.create_task(notify_closed_signal({**sig, **exit_data, "status": "closed"}))
                 except Exception as e:
                     log.warning(f"[v22] could not schedule close notify task: {e}")
+                try:
+                    asyncio.create_task(notify_closed_signal_push({**sig, **exit_data, "status": "closed"}))
+                except Exception as e:
+                    log.warning(f"[v22] could not schedule close push task: {e}")
         else:
             await asyncio.to_thread(touch_signal, sig["id"])
 
