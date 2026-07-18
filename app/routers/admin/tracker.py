@@ -1,5 +1,7 @@
 import os
 import logging
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -11,6 +13,11 @@ from supabase import Client
 
 log = logging.getLogger("app.admin.tracker")
 router = APIRouter(tags=["admin"])
+
+
+ANALYTICS_LOOKBACK_DAYS = 30
+ANALYTICS_PAGE_SIZE = 1000
+ANALYTICS_MAX_ROWS = 50000
 
 @router.get("/admin-check")
 async def admin_check(admin: Admin) -> dict:
@@ -59,6 +66,123 @@ async def get_stats(
         "blogs": blog_count,
         "strategies": strategy_count,
         "signals": signal_count,
+    }
+
+
+@router.get("/analytics")
+async def get_analytics(
+    admin: Admin,
+    db: Annotated[Client, Depends(get_db)],
+) -> dict:
+    """Return the latest first-party page-view metrics for the admin dashboard."""
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=ANALYTICS_LOOKBACK_DAYS - 1)
+    start_iso = start.isoformat()
+
+    try:
+        rows: list[dict] = []
+        offset = 0
+        while offset < ANALYTICS_MAX_ROWS:
+            result = (
+                db.table("page_views")
+                .select("path, visitor_id, session_id, referrer, created_at")
+                .gte("created_at", start_iso)
+                .order("created_at", desc=True)
+                .range(offset, offset + ANALYTICS_PAGE_SIZE - 1)
+                .execute()
+            )
+            batch = result.data or []
+            rows.extend(batch)
+            if len(batch) < ANALYTICS_PAGE_SIZE:
+                break
+            offset += ANALYTICS_PAGE_SIZE
+
+        waitlist_result = (
+            db.table("waitlist")
+            .select("id", count="exact")
+            .gte("created_at", start_iso)
+            .execute()
+        )
+        waitlist_signups = waitlist_result.count or 0
+    except Exception as exc:
+        log.error("Error fetching analytics: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Analytics are unavailable. Apply migration 004_web_analytics.sql.",
+        ) from exc
+
+    page_views_by_day: dict[str, int] = defaultdict(int)
+    visitors_by_day: dict[str, set[str]] = defaultdict(set)
+    page_metrics: dict[str, dict] = {}
+    referrer_metrics: dict[str, int] = defaultdict(int)
+    visitor_ids: set[str] = set()
+    session_ids: set[str] = set()
+    today = now.date().isoformat()
+
+    for row in rows:
+        created_at = row.get("created_at") or ""
+        day = created_at[:10]
+        if not day:
+            continue
+
+        visitor_id = row.get("visitor_id") or ""
+        session_id = row.get("session_id") or ""
+        path = row.get("path") or "/"
+        referrer = row.get("referrer") or "Direct"
+
+        visitor_ids.add(visitor_id)
+        session_ids.add(session_id)
+        page_views_by_day[day] += 1
+        if visitor_id:
+            visitors_by_day[day].add(visitor_id)
+
+        if path not in page_metrics:
+            page_metrics[path] = {"path": path, "page_views": 0, "visitor_ids": set()}
+        page_metrics[path]["page_views"] += 1
+        if visitor_id:
+            page_metrics[path]["visitor_ids"].add(visitor_id)
+
+        referrer_metrics[referrer] += 1
+
+    daily = []
+    for offset_days in range(ANALYTICS_LOOKBACK_DAYS - 1, -1, -1):
+        day = (now.date() - timedelta(days=offset_days)).isoformat()
+        daily.append(
+            {
+                "date": day,
+                "page_views": page_views_by_day[day],
+                "unique_visitors": len(visitors_by_day[day]),
+            }
+        )
+
+    top_pages = sorted(page_metrics.values(), key=lambda item: item["page_views"], reverse=True)[:8]
+    top_pages = [
+        {
+            "path": item["path"],
+            "page_views": item["page_views"],
+            "unique_visitors": len(item["visitor_ids"]),
+        }
+        for item in top_pages
+    ]
+    referrers = [
+        {"referrer": referrer, "page_views": count}
+        for referrer, count in sorted(referrer_metrics.items(), key=lambda item: item[1], reverse=True)[:8]
+    ]
+
+    return {
+        "period_days": ANALYTICS_LOOKBACK_DAYS,
+        "page_views": len(rows),
+        "unique_visitors": len(visitor_ids),
+        "sessions": len(session_ids),
+        "waitlist_signups": waitlist_signups,
+        "signup_conversion_rate": round((waitlist_signups / len(visitor_ids)) * 100, 1) if visitor_ids else 0,
+        "today": {
+            "page_views": page_views_by_day[today],
+            "unique_visitors": len(visitors_by_day[today]),
+        },
+        "daily": daily,
+        "top_pages": top_pages,
+        "referrers": referrers,
     }
 
 @router.get("/config")

@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import get_settings
-from app.routers import auth, waitlist, strategies, backtests, signals, showcase, blogs, telegram, push, admin, webhooks
+from app.routers import analytics, auth, waitlist, strategies, backtests, signals, showcase, blogs, telegram, push, admin, webhooks
 
 
 logging.basicConfig(
@@ -80,6 +80,7 @@ async def _supabase_error_handler(request: Request, exc: Exception) -> JSONRespo
 # ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(waitlist.router, prefix="/api/v1")
 app.include_router(auth.router, prefix="/api/v1")
+app.include_router(analytics.router, prefix="/api/v1")
 app.include_router(strategies.router, prefix="/api/v1")
 app.include_router(backtests.router, prefix="/api/v1")
 app.include_router(signals.router, prefix="/api/v1")
